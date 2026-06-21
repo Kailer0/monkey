@@ -177,11 +177,34 @@ end)
 -- ============================================================
 local function restoreTouchControls()
     if not mobile then return end
-    pcall(function() if PlayerModuleControls and PlayerModuleControls.Enable then PlayerModuleControls:Enable() end end)
+    -- (1) Re-enable the control module. Re-acquire a FRESH handle if our cached one
+    -- is missing/stale (require is cached, so this is cheap). The initial capture
+    -- could fail or go stale after a respawn -- that was a reason controls sometimes
+    -- never came back at all.
+    pcall(function()
+        local pm = PlayerModuleControls
+        if not (pm and pm.Enable) then
+            local mod = require(LocalPlayer.PlayerScripts:WaitForChild("PlayerModule", 2))
+            pm = mod and mod:GetControls()
+            PlayerModuleControls = pm
+        end
+        if pm and pm.Enable then pm:Enable() end
+    end)
+    -- (2) Force the master touch GUI back on.
     pcall(function()
         local pg = LocalPlayer:FindFirstChild("PlayerGui")
         local tg = pg and pg:FindFirstChild("TouchGui")
         if tg and not tg.Enabled then tg.Enabled = true end
+    end)
+    -- (3) THE KEY FIX: our synthetic KEYBOARD event (the BF move key) flipped
+    -- UserInputService.LastInputType to Keyboard, so Roblox's control module HID the
+    -- thumbstick/jump until the next *real* touch -- which never came, so they were
+    -- "gone for good." Nudge LastInputType back to Touch with a harmless corner touch
+    -- so the engine immediately re-shows the on-screen controls.
+    pcall(function()
+        local id = 91237
+        VirtualInputManager:SendTouchEvent(id, Enum.UserInputState.Begin.Value, 3, 3)
+        VirtualInputManager:SendTouchEvent(id, Enum.UserInputState.End.Value, 3, 3)
     end)
 end
 -- re-assert across a few frames so it wins regardless of signal ordering with the engine
@@ -1143,58 +1166,17 @@ do
     LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
 
     local oldDS
-    local dsBusy = false
     oldDS = hookmetamethod(game, "__namecall", function(self, ...)
         if St.autoDownslamEnabled and self == dsRemote and getnamecallmethod() == "FireServer" then
             local a = { ... }
-            -- The normal-attack direction arg is `false` on PC (nil on some mobile
-            -- builds). Rewrite it to "Down" so the hit is sent as a downslam. The
-            -- server only accepts a downslam while AIRBORNE.
+            -- Convert the combo finisher into a downslam by rewriting the direction
+            -- arg (false/nil -> "Down"), EXACTLY like the original working snippet.
+            -- IDENTICAL on PC and mobile -- you asked for the same version on both.
+            -- Only the finisher reaches this remote (regular M1s use a different one),
+            -- so this never wastes hits. The previous mobile-only "pop into the air +
+            -- suppress the hit" branch is what was breaking mobile downslam, so it has
+            -- been removed entirely.
             if a[1] == false or a[1] == nil then
-                if mobile then
-                    -- a pop+downslam is already running; eat duplicate taps
-                    if dsBusy then return end
-                    local c   = LocalPlayer.Character
-                    local hum = c and c:FindFirstChildOfClass("Humanoid")
-                    local hrp = c and c:FindFirstChild("HumanoidRootPart")
-                    local function isAir()
-                        if not hum then return false end
-                        local st = hum:GetState()
-                        return st == Enum.HumanoidStateType.Freefall
-                            or st == Enum.HumanoidStateType.Jumping
-                            or hum.FloorMaterial == Enum.Material.Air
-                    end
-                    if hum and hrp and not isAir() then
-                        -- GROUNDED on mobile: mobile players can't reliably jump AND
-                        -- attack in one motion, so pop ourselves into the air, wait
-                        -- until we're actually airborne, then fire the downslam.
-                        -- Suppress the grounded hit so it isn't wasted on the server.
-                        dsBusy = true
-                        local target = a[2]
-                        task.spawn(function()
-                            pcall(function()
-                                hrp.AssemblyLinearVelocity = Vector3.new(
-                                    hrp.AssemblyLinearVelocity.X, 50, hrp.AssemblyLinearVelocity.Z)
-                            end)
-                            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-                            local t0 = os.clock()
-                            while not isAir() and os.clock() - t0 < 0.4 do
-                                RunService.Heartbeat:Wait()
-                            end
-                            task.wait(0.03)
-                            -- real method call: re-enters the hook with a[1]=="Down",
-                            -- which skips this block and passes straight to the server.
-                            pcall(function() dsRemote:FireServer("Down", target) end)
-                            task.wait(0.06)
-                            dsBusy = false
-                        end)
-                        return
-                    end
-                    -- already airborne on mobile -> just convert this hit in-flight
-                    a[1] = "Down"
-                    return oldDS(self, unpack(a))
-                end
-                -- PC: convert in-flight (jump into the finisher like normal)
                 a[1] = "Down"
                 return oldDS(self, unpack(a))
             end
@@ -3040,6 +3022,13 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
     local activeInput = nil    -- the exact InputObject driving this button
     local holdActive = false   -- whether action(true) is currently engaged (hold buttons)
     local DRAG_THRESHOLD = 8
+    -- SMOOTH DRAG: the finger sets a target offset and a RenderStepped loop eases the
+    -- frame toward it, so dragging glides instead of stepping between touch samples.
+    local dragTarget = nil
+    local dragRender = nil
+    local function stopDragRender()
+        if dragRender then dragRender:Disconnect(); dragRender = nil end
+    end
 
     local function releaseHold()
         if holdActive then
@@ -3055,6 +3044,8 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
         local wasMoved = moved
         drag = false
         activeInput = nil
+        stopDragRender()
+        if dragTarget then f.Position = UDim2.fromOffset(dragTarget.X, dragTarget.Y); dragTarget = nil end
         if isHoldBtn then
             releaseHold()
         else
@@ -3078,6 +3069,14 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
             activeInput = i
             dragOr = Vector2.new(i.Position.X, i.Position.Y)
             frOr = Vector2.new(f.Position.X.Offset, f.Position.Y.Offset)
+            stopDragRender()
+            dragTarget = frOr
+            dragRender = RunService.RenderStepped:Connect(function()
+                if not drag or not dragTarget then return end
+                local cur2 = Vector2.new(f.Position.X.Offset, f.Position.Y.Offset)
+                local nxt = cur2:Lerp(dragTarget, 0.5)
+                f.Position = UDim2.fromOffset(nxt.X, nxt.Y)
+            end)
             if isHoldBtn then
                 holdActive = true
                 s.Color = c2; l.TextColor3 = c2
@@ -3099,7 +3098,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
             local vpc = Camera.ViewportSize
             nx = math.clamp(nx, 0, math.max(0, vpc.X - f.AbsoluteSize.X))
             ny = math.clamp(ny, 0, math.max(0, vpc.Y - f.AbsoluteSize.Y))
-            f.Position = UDim2.fromOffset(nx, ny)
+            dragTarget = Vector2.new(nx, ny)
         end
     end)
 
@@ -3221,7 +3220,9 @@ if mobile then
 
     -- 2. Fly Controls Overlays (Up/Down/Boost)
     table.insert(_G.flyFloatGuis, createFloatButton("FlyUpBtn", "UP", vp.X-80, vp.Y-320, Color3.fromRGB(30,150,150), Color3.fromRGB(80,255,255), function(state) flyKeys.Up = state end, true))
-    table.insert(_G.flyFloatGuis, createFloatButton("FlyDownBtn", "DOWN", vp.X-80, vp.Y-80, Color3.fromRGB(150,80,30), Color3.fromRGB(255,150,80), function(state) flyKeys.Down = state end, true))
+    -- moved up from vp.Y-80 (it was sitting at the very bottom edge / off-screen on
+    -- phones) to sit right above the UP button in the same right-hand column.
+    table.insert(_G.flyFloatGuis, createFloatButton("FlyDownBtn", "DOWN", vp.X-80, vp.Y-400, Color3.fromRGB(150,80,30), Color3.fromRGB(255,150,80), function(state) flyKeys.Down = state end, true))
     table.insert(_G.flyFloatGuis, createFloatButton("FlyBoostBtn", "BOOST", vp.X-240, vp.Y-160, Color3.fromRGB(200,50,50), Color3.fromRGB(255,100,100), function(state) flyKeys.Boost = state end, true))
 
     _G.mainOverlayMaster = false
@@ -3311,16 +3312,21 @@ if mobile then
             -- TAP (not a drag) => toggle the hub. Movement flag is far more reliable
             -- on touch than comparing the release position.
             if not dotMoved then
+                -- Toggle the hub through Fluent's OWN minimize keybind (RightControl).
+                -- This is Fluent's native show/hide path, so it ALWAYS matches Fluent's
+                -- internal minimized state. The old code flipped ScreenGui.Enabled, which
+                -- canNOT restore a window minimized from the hub's own minimize button
+                -- (Fluent keeps the ScreenGui Enabled while minimized) -- THAT is why the
+                -- dot "did nothing" after you minimized from the hub. We know synthetic keys
+                -- register on this executor because the BF move key works; Fluent listens
+                -- for this keybind via UserInputService.InputBegan, so it always toggles.
                 local g = findHubGui()
-                if g then
-                    g.Enabled = not g.Enabled
-                    notify("Hub", g.Enabled and "Hub shown." or "Hub hidden.", 1.5)
-                else
-                    -- last-resort fallback (PC / keyboard executors only)
-                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.RightControl, false, game)
-                    task.wait(0.05)
-                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.RightControl, false, game)
-                end
+                if g and not g.Enabled then g.Enabled = true end -- heal any stale Enabled=false
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.RightControl, false, game)
+                task.wait()
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.RightControl, false, game)
+                -- the keybind briefly flips LastInputType off Touch -> heal the joystick
+                if mobile then reassertControls() end
             end
         end 
     end)
