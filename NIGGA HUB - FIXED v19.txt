@@ -3394,27 +3394,98 @@ if mobile then
         end
         return cachedHubGui
     end
-    -- UNIFIED HUB TOGGLE: show/hide the entire hub via ScreenGui.Enabled. No Fluent
-    -- minimize, no synthetic keys -> identical on PC + mobile and never touches the
-    -- joystick. The green dot AND Fluent's in-UI minimize button both run THIS, so they
-    -- are always in sync (that pairing is exactly what you asked for).
-    local function toggleHub()
+    -- ===========================================================================
+    -- AUTHORITATIVE HUB VISIBILITY -- the green dot is the SINGLE source of truth.
+    --
+    -- Why the dot "did nothing" after you minimized FROM the hub: Fluent's own
+    -- minimize button collapses the window into Fluent's INTERNAL minimized state
+    -- (it shrinks/hides the window frame) while leaving the ScreenGui Enabled. So
+    -- just flipping ScreenGui.Enabled toggled an already-collapsed window and never
+    -- brought the body back.
+    --
+    -- This version does NOT rely on finding Fluent's minimize button by name (that
+    -- was unreliable across Fluent builds). Instead it:
+    --   1) caches the window's main Frame + its full size,
+    --   2) on SHOW, force-restores that frame to full size/visible (undoing ANY
+    --      Fluent collapse), holding it for a few frames in case Fluent is mid-tween,
+    --   3) runs a tiny watcher that DETECTS a Fluent collapse (frame hidden or
+    --      shrunk) and converts it into our OWN clean hide -- so the dot always
+    --      reopens the FULL window in one tap, no matter how it was minimized.
+    -- ===========================================================================
+    local hubRoot, hubFullSize, hubFullAbsY = nil, nil, 0
+    local hubEverFull = false
+    local hubUserHidden = false
+
+    local function ensureHubRefs()
         local g = findHubGui()
-        if not g then return end
-        g.Enabled = not g.Enabled
+        if not g then return nil end
+        -- Fluent's window body is the direct child Frame of its ScreenGui; that is the
+        -- frame Fluent resizes/hides when it minimizes.
+        if not hubRoot or not hubRoot.Parent or hubRoot.Parent ~= g then
+            hubRoot = g:FindFirstChildWhichIsA("Frame")
+        end
+        return g
     end
-    -- Re-route Fluent's own in-UI minimize button to toggleHub and kill its native
-    -- minimize, so the window can never get stuck in Fluent's collapsed state -- that
-    -- collapsed state is exactly why the dot couldn't reopen the hub after you minimized
-    -- from the hub's own button.
-    -- Make Fluent's OWN in-UI minimize button do the EXACT same thing as the green dot.
-    -- We do NOT depend on getconnections (not on every executor), and we NEVER let Fluent's
-    -- native minimize run -- that native collapse is what left the window stuck so the dot
-    -- couldn't reopen it. Instead we lay a TRANSPARENT button ON TOP of Fluent's minimize
-    -- button (higher ZIndex), so every tap hits OURS and routes to toggleHub. (Connecting
-    -- BOTH MouseButton1Click and Activated would fire toggleHub twice = a no-op, which was
-    -- the old bug.) getconnections:Disable() is attempted only as a bonus. Retried a few
-    -- times in case Fluent's title bar builds late.
+
+    local function restoreHubWindow()
+        if hubRoot and hubFullSize then
+            pcall(function()
+                hubRoot.Visible = true
+                hubRoot.Size = hubFullSize
+            end)
+        end
+    end
+
+    local function showHub()
+        local g = ensureHubRefs()
+        if not g then return end
+        hubUserHidden = false
+        g.Enabled = true
+        restoreHubWindow()
+        -- hold it open for a few frames so a Fluent collapse-tween can't re-hide it
+        task.spawn(function()
+            for _ = 1, 14 do restoreHubWindow() RunService.Heartbeat:Wait() end
+        end)
+    end
+
+    local function hideHub()
+        local g = ensureHubRefs()
+        if not g then return end
+        hubUserHidden = true
+        restoreHubWindow() -- pre-restore size so the NEXT show is full & instant
+        g.Enabled = false
+    end
+
+    local function toggleHub()
+        local g = ensureHubRefs()
+        if not g then return end
+        if g.Enabled and not hubUserHidden then hideHub() else showHub() end
+    end
+
+    -- Watcher: learn the full size while open, and convert Fluent's native minimize
+    -- (frame hidden OR shrunk) into our clean hide so the dot can restore it.
+    RunService.Heartbeat:Connect(function()
+        local g = ensureHubRefs()
+        if not g or not hubRoot then return end
+        if hubUserHidden or not g.Enabled then return end
+        local absY = hubRoot.AbsoluteSize.Y
+        if hubRoot.Visible and absY > 90 then
+            -- fully expanded -> remember this as the real full size
+            hubFullSize = hubRoot.Size
+            hubFullAbsY = absY
+            hubEverFull = true
+        elseif hubEverFull and ((not hubRoot.Visible) or (hubFullAbsY > 0 and absY < hubFullAbsY * 0.6)) then
+            -- it was full and is now collapsed even though WE didn't hide it =>
+            -- Fluent minimized it. Convert into our clean hide (dot will reopen full).
+            hubUserHidden = true
+            restoreHubWindow()
+            g.Enabled = false
+        end
+    end)
+
+    -- Bonus: on builds where we CAN find Fluent's minimize button, intercept it so the
+    -- window doesn't even flash its collapse. Harmless if not found -- the watcher above
+    -- is the real guarantee. Route it to hideHub (our clean hide), not Fluent's collapse.
     local minimizeWired = false
     local function wireMinimizeButton()
         if minimizeWired then return end
@@ -3422,12 +3493,6 @@ if mobile then
         if not g then return end
         for _, d in ipairs(g:GetDescendants()) do
             if (d:IsA("ImageButton") or d:IsA("TextButton")) and typeof(d.Name) == "string" and string.find(string.lower(d.Name), "minimize") then
-                pcall(function()
-                    if getconnections then
-                        for _, c in ipairs(getconnections(d.MouseButton1Click)) do pcall(function() c:Disable() end) end
-                        for _, c in ipairs(getconnections(d.Activated)) do pcall(function() c:Disable() end) end
-                    end
-                end)
                 if not d:FindFirstChild("NH_MinOverlay") then
                     local ov = Instance.new("TextButton")
                     ov.Name = "NH_MinOverlay"
@@ -3438,7 +3503,7 @@ if mobile then
                     ov.ZIndex = (d.ZIndex or 1) + 50
                     ov.Active = true
                     ov.Parent = d
-                    ov.Activated:Connect(toggleHub)
+                    ov.Activated:Connect(function() hideHub() end)
                 end
                 minimizeWired = true
                 break
