@@ -3424,106 +3424,66 @@ if mobile then
     --      shrunk) and converts it into our OWN clean hide -- so the dot always
     --      reopens the FULL window in one tap, no matter how it was minimized.
     -- ===========================================================================
-    local hubRoot, hubFullSize, hubFullAbsY, hubFullAbsX = nil, nil, 0, 0
-    local hubEverFull = false
-    local hubUserHidden = false
-
-    local function ensureHubRefs()
-        local g = findHubGui()
-        if not g then return nil end
-        if not hubRoot or not hubRoot.Parent or hubRoot.Parent ~= g then
-            -- The window body is the gui's direct child that CONTAINS the title text.
-            -- Picking the title's top-level ancestor is FAR more reliable than grabbing
-            -- the first Frame, which can be a full-screen acrylic/background layer that
-            -- never changes when Fluent minimizes -- THAT is why minimize detection failed.
-            local titleObj
-            for _, d in ipairs(g:GetDescendants()) do
-                if (d:IsA("TextLabel") or d:IsA("TextButton")) and typeof(d.Text) == "string" and (string.find(d.Text, "Nigga") or string.find(d.Text, "Ultimate Edition")) then
-                    titleObj = d break
-                end
-            end
-            if titleObj then
-                local node = titleObj
-                while node and node.Parent and node.Parent ~= g do node = node.Parent end
-                if node and node:IsA("GuiObject") then hubRoot = node end
-            end
-            if not hubRoot or not hubRoot:IsA("GuiObject") then hubRoot = g:FindFirstChildWhichIsA("Frame") end
-        end
-        return g
-    end
-
-    local function restoreHubWindow()
-        if hubRoot and hubFullSize then
-            pcall(function()
-                hubRoot.Visible = true
-                hubRoot.Size = hubFullSize
-            end)
-        end
-    end
-
-    local function showHub()
-        local g = ensureHubRefs()
-        if not g then return end
-        hubUserHidden = false
-        g.Enabled = true
-        restoreHubWindow()
-        -- hold it open for a few frames so a Fluent collapse-tween can't re-hide it
-        task.spawn(function()
-            for _ = 1, 14 do restoreHubWindow() RunService.Heartbeat:Wait() end
-        end)
-    end
-
-    local function hideHub()
-        local g = ensureHubRefs()
-        if not g then return end
-        hubUserHidden = true
-        restoreHubWindow() -- pre-restore size so the NEXT show is full & instant
-        g.Enabled = false
-    end
-
-    local function toggleHub()
-        local g = ensureHubRefs()
-        if not g then return end
-        if g.Enabled and not hubUserHidden then hideHub() else showHub() end
-    end
-
     -- ===========================================================================
-    -- UI TOGGLE *ON TOP OF* THE MINIMIZE BUTTON (mobile) -- the approach you asked for,
-    -- finally done right. The two real reasons it failed before are both fixed:
-    --   (1) WRONG BUTTON: we used to guess the window frame and search from there. The
-    --       guess was wrong, so detection found nothing. Now we anchor to the TITLE TEXT
-    --       (we can always find that) and grab the small button on the SAME ROW, to its
-    --       RIGHT -- that is the minimize button, every Fluent build.
-    --   (2) WRONG LAYER: a separate top ScreenGui did NOT block the tap, because Fluent
-    --       draws in CoreGui/gethui ABOVE a PlayerGui overlay -- so Fluent's button still
-    --       got the tap and natively collapsed the window (which our show couldn't undo).
-    --       Now the transparent toggle is parented AS A CHILD of the minimize button with
-    --       a higher ZIndex, so it lives in Fluent's OWN layer and reliably eats the tap.
-    -- The tap routes to our clean hide/show (ScreenGui.Enabled). Fluent never collapses
-    -- the window, so it always reopens FULL. Tapping it == tapping the green dot.
+    -- UNIFIED, BULLETPROOF HUB TOGGLE (mobile) -- rebuilt from scratch.
+    -- Two fatal bugs in the previous version are fixed here:
+    --   * hubFullSize was NEVER learned (the size-learning watcher had been deleted),
+    --     so restore was a silent no-op -> after a Fluent minimize nothing could resize
+    --     the window back.
+    --   * toggleHub ran BACKWARDS after a Fluent minimize (Enabled was still true), so
+    --     the first tap hid instead of showed.
+    -- New model: ONE boolean `hubVisible` is the single source of truth, flipped by the
+    -- green dot (and the minimize button). A permanent master loop then GUARANTEES the
+    -- on-screen result no matter what Fluent does:
+    --   1) continuously LEARNS the window's real full size while it is open & expanded,
+    --   2) forces ScreenGui.Enabled to match hubVisible (the always-reliable primitive),
+    --   3) while visible, INSTANTLY un-collapses the window every frame if Fluent ever
+    --      minimizes it -- forever, with no 14-frame limit and no auto-hide branch to
+    --      fight it, so the window can never get stuck closed,
+    --   4) defangs + overlays Fluent's own minimize button so it just toggles hubVisible.
+    -- Result: the dot OR the minimize button always reopens the FULL UI in one tap.
     -- ===========================================================================
-    local function findTitleObj(g)
+    local hubVisible = true
+    local hubRoot = nil
+    local hubFullSize = nil
+    local hubFullAbsY = 0
+
+    local function findWindowRoot(g)
+        if hubRoot and hubRoot.Parent == g then return hubRoot end
+        hubRoot = nil
+        local titleObj
         for _, d in ipairs(g:GetDescendants()) do
             if (d:IsA("TextLabel") or d:IsA("TextButton")) and typeof(d.Text) == "string" and (string.find(d.Text, "Nigga") or string.find(d.Text, "Ultimate Edition")) then
-                return d
+                titleObj = d break
             end
         end
+        if titleObj then
+            local node = titleObj
+            while node and node.Parent and node.Parent ~= g do node = node.Parent end
+            if node and node:IsA("GuiObject") then hubRoot = node end
+        end
+        if not hubRoot then hubRoot = g:FindFirstChildWhichIsA("Frame") end
+        return hubRoot
     end
-    local function wireMinToggle()
-        local g = findHubGui()
-        if not g then return end
-        local title = findTitleObj(g)
-        if not title then return end
-        local tY = title.AbsolutePosition.Y + title.AbsoluteSize.Y * 0.5  -- title-bar row center
-        local tX = title.AbsolutePosition.X
+
+    local function showHub() hubVisible = true end
+    local function hideHub() hubVisible = false end
+    local function toggleHub() hubVisible = not hubVisible end
+
+    -- Best-effort: route Fluent's own minimize button to our toggle and defang its native
+    -- collapse. This never has to be perfect -- the master loop below is the real guarantee.
+    local function wireMinToggle(g, root)
+        if not g or not root then return end
+        local tCenterY = root.AbsolutePosition.Y + 18 -- the title bar sits at the very top of the window
+        local rightHalf = root.AbsolutePosition.X + root.AbsoluteSize.X * 0.5
         local best, bestX = nil, -math.huge
         for _, d in ipairs(g:GetDescendants()) do
-            if (d:IsA("ImageButton") or d:IsA("TextButton")) and d.Name ~= "NH_MinToggle" and not d:FindFirstChild("NH_MinToggle") then
+            if (d:IsA("ImageButton") or d:IsA("TextButton")) and d.Name ~= "NH_MinToggle" then
                 local sz = d.AbsoluteSize
                 local cY = d.AbsolutePosition.Y + sz.Y * 0.5
-                if sz.X > 0 and sz.X <= 64 and sz.Y <= 64                  -- a small control, not a panel
-                   and math.abs(cY - tY) <= 26                             -- same row as the title text
-                   and d.AbsolutePosition.X > tX then                      -- sits to the RIGHT of the title
+                if sz.X > 0 and sz.X <= 70 and sz.Y <= 70
+                   and math.abs(cY - tCenterY) <= 30
+                   and d.AbsolutePosition.X > rightHalf then
                     if d.AbsolutePosition.X > bestX then bestX = d.AbsolutePosition.X; best = d end
                 end
             end
@@ -3533,22 +3493,51 @@ if mobile then
             local ov = Instance.new("TextButton")
             ov.Name = "NH_MinToggle"
             ov.Size = UDim2.fromScale(1, 1)
-            ov.Position = UDim2.fromScale(0, 0)
             ov.BackgroundTransparency = 1
             ov.Text = ""
             ov.AutoButtonColor = false
             ov.Active = true
             ov.ZIndex = (best.ZIndex or 1) + 100
             ov.Parent = best
-            ov.Activated:Connect(function() toggleHub() end)
-            ov.MouseButton1Click:Connect(function() toggleHub() end)
+            ov.Activated:Connect(toggleHub)
+            ov.MouseButton1Click:Connect(toggleHub)
         end
-        -- belt & suspenders: defang the native minimize so even a missed tap can't collapse it
         pcall(function() best.Active = false; best.AutoButtonColor = false end)
     end
-    -- keep it wired: a few initial passes + a light re-check (Fluent can rebuild its title bar)
-    for _, t in ipairs({0.3, 0.8, 1.5, 3, 5}) do task.delay(t, wireMinToggle) end
-    task.spawn(function() while true do task.wait(2); pcall(wireMinToggle) end end)
+
+    -- THE MASTER GUARANTEE LOOP -------------------------------------------------------
+    local minScan = 0
+    RunService.Heartbeat:Connect(function(dt)
+        local g = findHubGui()
+        if not g then return end
+        local root = findWindowRoot(g)
+
+        -- 1) learn the real full size while the window is open & expanded
+        if hubVisible and root and root.Visible and root.AbsoluteSize.X > 140 and root.AbsoluteSize.Y > 140 then
+            hubFullSize = root.Size
+            hubFullAbsY = root.AbsoluteSize.Y
+        end
+
+        -- 2) visibility is driven purely by hubVisible
+        if g.Enabled ~= hubVisible then g.Enabled = hubVisible end
+
+        -- 3) while visible, INSTANTLY undo any Fluent collapse so it can never stick
+        if hubVisible and root and hubFullSize then
+            if (not root.Visible) or (hubFullAbsY > 0 and root.AbsoluteSize.Y < hubFullAbsY * 0.7) then
+                pcall(function()
+                    root.Visible = true
+                    root.Size = hubFullSize
+                end)
+            end
+        end
+
+        -- 4) keep Fluent's own minimize button defanged + overlaid (~3x/sec, cheap)
+        minScan = minScan + dt
+        if minScan >= 0.33 then
+            minScan = 0
+            pcall(wireMinToggle, g, root)
+        end
+    end)
     -- (PC toggle is handled natively by Fluent's MinimizeKey = LeftControl, set at window
     -- creation for a smooth native minimize. This mobile-only block needs no key handler.)
     dotBtn.InputBegan:Connect(function(i) 
