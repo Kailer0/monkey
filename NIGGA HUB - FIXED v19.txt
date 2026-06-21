@@ -1184,17 +1184,17 @@ end
 do
     local dsRemote = nil
     local function dsLiftOff(c, hum)
-        -- Guaranteed liftoff: hum.Jump alone is often ignored mid-combo on mobile
-        -- (the combo's Movement state suppresses it), so we ALSO inject an upward
-        -- velocity (preserving horizontal momentum). This reliably gets the character
-        -- AIRBORNE, which the server REQUIRES before it will accept a "Down" finisher.
+        -- GENTLE hop -- just enough to lift the feet off the ground so the server will
+        -- accept a "Down" finisher. Previously this injected a big upward velocity (50)
+        -- AND forced a Jumping state, which launched the character way up and looked
+        -- choppy. We now do a natural jump and cap the upward velocity LOW for a slight,
+        -- smooth lift. No forced state change.
         pcall(function() hum.Jump = true end)
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
         local hrp = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart"))
         if hrp then
             pcall(function()
                 local v = hrp.AssemblyLinearVelocity
-                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 50, v.Z)
+                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 22, v.Z)
             end)
         end
     end
@@ -1217,30 +1217,17 @@ do
     local function watchChar(c)
         resolveDS()
         pcall(function() c:GetAttributeChangedSignal("Moveset"):Connect(resolveDS) end)
-        -- MOBILE DOWNSLAM: the server only accepts a "Down" finisher while AIRBORNE. On PC
-        -- the combo already pops you off the ground by the finisher; on mobile it doesn't.
-        -- So we watch the combo counter and, right after the 3rd M1, press jump (exactly
-        -- like tapping the jump button) -- then when YOU tap the 4th M1 the finisher fires
-        -- in the air and the hook below turns it into a downslam. No swallow, no spam.
-        pcall(function()
-            c:GetAttributeChangedSignal("CurrentM1"):Connect(function()
-                if not St.autoDownslamEnabled then return end
-                local n = c:GetAttribute("CurrentM1")
-                if n == 3 then
-                    local hum = c:FindFirstChildOfClass("Humanoid")
-                    if hum and not dsAirborne(hum) then
-                        dsLiftOff(c, hum)
-                    end
-                end
-            end)
-        end)
+        -- NO pre-jump on the 3rd M1 anymore. That hop fired too EARLY (a full M1 before
+        -- the finisher) and too high, which is what made the downslam look choppy and
+        -- launch you up. The finisher hook below now does a single SMALL hop at the exact
+        -- moment the 4th-M1 finisher fires, so the lift lands right on the downslam.
     end
     if LocalPlayer.Character then watchChar(LocalPlayer.Character) end
     LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
 
     local oldDS
     local dsRefiring = false
-    oldDS = hookmetamethod(game, "__namecall", function(self, ...)
+    local function dsHook(self, ...)
         if St.autoDownslamEnabled and not dsRefiring and self == dsRemote and getnamecallmethod() == "FireServer" then
             local a = { ... }
             local d = a[1]
@@ -1271,7 +1258,15 @@ do
             end
         end
         return oldDS(self, ...)
+    end
+    -- Install the finisher hook behind a pcall: a few mobile executors don't support
+    -- hookmetamethod. If it isn't supported here, the rest of the hub still loads fine
+    -- (auto-downslam simply won't convert the finisher). Since your downslam currently
+    -- works, your executor DOES support it -- this just makes the script crash-proof.
+    local dsHookOk = pcall(function()
+        oldDS = hookmetamethod(game, "__namecall", dsHook)
     end)
+    if not dsHookOk then warn("[NH] auto-downslam: hookmetamethod not supported on this executor") end
 end
 
 local function startAutoQTE()
@@ -1862,18 +1857,11 @@ do
     if player.Character then task.spawn(hookLocalM1, player.Character) end
     player.CharacterAdded:Connect(hookLocalM1)
 
-    -- Robust cross-moveset / cross-platform trigger: any raw M1 input (left
-    -- click on PC, screen tap on mobile) also runs the block-break check. The
-    -- heavy guards in tryBlockBreak mean stray clicks/taps do nothing unless a
-    -- blocker is actually in front of you within melee range.
-    UserInputService.InputBegan:Connect(function(input, gpe)
-        if gpe then return end
-        if not St.autoBlockBreakEnabled then return end
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            task.spawn(tryBlockBreak)
-        end
-    end)
+    -- IMPORTANT: block-break is triggered ONLY by the AnimationPlayed hook above (a real
+    -- M1 SWING animation). We deliberately removed the old raw-InputBegan trigger: on
+    -- mobile EVERY screen tap (joystick, camera drag, any button) is a Touch input, so it
+    -- made the hub dash-behind + block-break "on its own" with no real M1. Now a manual
+    -- M1 in front of a blocking target is the ONLY thing that starts a block break.
 end
 
 
@@ -2461,36 +2449,17 @@ local function bfFireCharged(effTime, target, skipOrient)
                 end
             end)
         end
-        -- Fire the move remote DIRECTLY instead of synthesizing KeyCode.Three. Synthetic
-        -- keys flip LastInputType off Touch -> Roblox hides the mobile joystick (the whole
-        -- reason the BF chain nuked it). M1/Divergent = <Moveset>Service.RE.Activated:
-        -- FireServer(movesetInstance, bfBool); bfBool=false normal, true = Black Flash.
-        local function nhMI()
-            local ch = player.Character
-            local container = ch and ch:FindFirstChild("Moveset")
-            if not container then return nil end
-            local mvName = ch:GetAttribute("Moveset")
-            return (mvName and container:FindFirstChild(mvName)) or container:GetChildren()[1]
-        end
-        local function nhRE()
-            local ch = player.Character
-            local mvName = ch and ch:GetAttribute("Moveset")
-            if not mvName then return nil end
-            local ok, re = pcall(function() return ReplicatedStorage.Knit.Knit.Services[(mvName:gsub("%s", "")) .. "Service"].RE.Activated end)
-            return ok and re or nil
-        end
-        -- HIT 1 (charge) -- normal Divergent Fist (advances combo)
-        do
-            local re, mi = nhRE(), nhMI()
-            if re and mi then
-                pcall(function() re:FireServer(mi, false) end)
-                task.wait(BF.HOLD)
-            else
-                VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-                task.wait(BF.HOLD)
-                VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
-            end
-        end
+        -- HIT 1 (charge) -- Black Flash is a CLIENT-SIDE TIMING mechanic: the game's own
+        -- DivergentFist controller measures the gap between these two key presses and only
+        -- THEN flags the hit as a Black Flash. Firing the remote directly (even with the BF
+        -- bool=true) bypasses that flow, so the server treated it as a plain M1 and no
+        -- flash happened -- that's why v35 "dashed + M1'd but never flashed." So we MUST
+        -- send the real key here. The continuous synthetic MOUSE steering that used to hide
+        -- the joystick is already gone, and the per-frame touch guard above keeps the
+        -- thumbstick alive across these two brief key taps.
+        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+        task.wait(BF.HOLD)
+        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         if mobile then restoreTouchControls() end
         -- wait the golden interval (down-to-down = effTime), precise at the end
         local target_t = os.clock() + (effTime - BF.HOLD)
@@ -2498,18 +2467,11 @@ local function bfFireCharged(effTime, target, skipOrient)
             RunService.Heartbeat:Wait()
         end
         while bfActive and os.clock() < target_t do end
-        -- HIT 2 (release the flash) -- Black Flash variant: bool = true
-        do
-            local re, mi = nhRE(), nhMI()
-            if re and mi then
-                pcall(function() re:FireServer(mi, true) end)
-                task.wait(BF.HOLD)
-            else
-                VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-                task.wait(BF.HOLD)
-                VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
-            end
-        end
+        -- HIT 2 (release the flash) -- the second precisely-timed press is what the
+        -- controller reads as a Black Flash and fires with the BF flag set.
+        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+        task.wait(BF.HOLD)
+        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
         if mobile then restoreTouchControls() end
         -- tear down the per-frame guard shortly after the flash, with a final restore pass
