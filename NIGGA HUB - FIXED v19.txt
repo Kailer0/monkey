@@ -256,6 +256,22 @@ if mobile then
     end
     -- touch controls are rebuilt on respawn -> re-hook and re-assert
     LocalPlayer.CharacterAdded:Connect(function() task.delay(0.6, function() hookTouchGui(); reassertControls() end) end)
+    -- PERSISTENT POLL GUARD -- the real fix for "BF chain killed my joysticks for good":
+    -- LastInputTypeChanged only fires on a CHANGE. Once a synthetic BF key (KeyCode.Three)
+    -- leaves LastInputType STUCK on Keyboard and no real touch follows, NO further event
+    -- ever fires, so the event-driven restore never runs and the joystick + jump button
+    -- stay hidden indefinitely. This poll detects the stuck non-touch state and restores.
+    -- It is self-limiting: restoreTouchControls() sends a harmless corner touch that flips
+    -- LastInputType back to Touch, so on a real touch device it only kicks in right after
+    -- our synthetic keys, then goes idle (no thumbstick reset while you're actually moving).
+    task.spawn(function()
+        while true do
+            task.wait(0.12)
+            if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then
+                restoreTouchControls()
+            end
+        end
+    end)
 end
 
 -- ============================================================
@@ -1167,6 +1183,27 @@ end
 -- refreshed on respawn / moveset change.
 do
     local dsRemote = nil
+    local function dsLiftOff(c, hum)
+        -- Guaranteed liftoff: hum.Jump alone is often ignored mid-combo on mobile
+        -- (the combo's Movement state suppresses it), so we ALSO inject an upward
+        -- velocity (preserving horizontal momentum). This reliably gets the character
+        -- AIRBORNE, which the server REQUIRES before it will accept a "Down" finisher.
+        pcall(function() hum.Jump = true end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        local hrp = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart"))
+        if hrp then
+            pcall(function()
+                local v = hrp.AssemblyLinearVelocity
+                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 50, v.Z)
+            end)
+        end
+    end
+    local function dsAirborne(hum)
+        if not hum then return false end
+        if hum.FloorMaterial == Enum.Material.Air then return true end
+        local st = hum:GetState()
+        return st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping
+    end
     local function resolveDS()
         local c = LocalPlayer.Character
         local mv = c and c:GetAttribute("Moveset")
@@ -1192,9 +1229,8 @@ do
                 local n = c:GetAttribute("CurrentM1")
                 if n == 3 then
                     local hum = c:FindFirstChildOfClass("Humanoid")
-                    if hum and hum.FloorMaterial ~= Enum.Material.Air then
-                        pcall(function() hum.Jump = true end)
-                        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                    if hum and not dsAirborne(hum) then
+                        dsLiftOff(c, hum)
                     end
                 end
             end)
@@ -1225,13 +1261,12 @@ do
                 -- grounded: do a quick natural hop, wait until actually airborne, THEN send
                 -- the Down finisher (swallow the grounded send, re-send it in the air).
                 -- Only ever runs on the finisher (one fire per combo), so it can't spam M1s.
-                if hum and hrp and hum.FloorMaterial ~= Enum.Material.Air then
+                if hum and hrp and not dsAirborne(hum) then
                     dsRefiring = true
                     task.spawn(function()
-                        pcall(function() hum.Jump = true end)
-                        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                        dsLiftOff(ch, hum)
                         local t0 = os.clock()
-                        repeat RunService.Heartbeat:Wait() until hum.FloorMaterial == Enum.Material.Air or (os.clock() - t0) > 0.6
+                        repeat RunService.Heartbeat:Wait() until dsAirborne(hum) or (os.clock() - t0) > 1.0
                         pcall(function() oldDS(dsRemote, "Down", tgt) end)
                         task.wait(0.05)
                         dsRefiring = false
