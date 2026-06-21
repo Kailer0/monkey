@@ -3407,139 +3407,55 @@ if mobile then
         return cachedHubGui
     end
     -- ===========================================================================
-    -- AUTHORITATIVE HUB VISIBILITY -- the green dot is the SINGLE source of truth.
-    --
-    -- Why the dot "did nothing" after you minimized FROM the hub: Fluent's own
-    -- minimize button collapses the window into Fluent's INTERNAL minimized state
-    -- (it shrinks/hides the window frame) while leaving the ScreenGui Enabled. So
-    -- just flipping ScreenGui.Enabled toggled an already-collapsed window and never
-    -- brought the body back.
-    --
-    -- This version does NOT rely on finding Fluent's minimize button by name (that
-    -- was unreliable across Fluent builds). Instead it:
-    --   1) caches the window's main Frame + its full size,
-    --   2) on SHOW, force-restores that frame to full size/visible (undoing ANY
-    --      Fluent collapse), holding it for a few frames in case Fluent is mid-tween,
-    --   3) runs a tiny watcher that DETECTS a Fluent collapse (frame hidden or
-    --      shrunk) and converts it into our OWN clean hide -- so the dot always
-    --      reopens the FULL window in one tap, no matter how it was minimized.
-    -- ===========================================================================
-    -- ===========================================================================
-    -- UNIFIED, BULLETPROOF HUB TOGGLE (mobile) -- rebuilt from scratch.
-    -- Two fatal bugs in the previous version are fixed here:
-    --   * hubFullSize was NEVER learned (the size-learning watcher had been deleted),
-    --     so restore was a silent no-op -> after a Fluent minimize nothing could resize
-    --     the window back.
-    --   * toggleHub ran BACKWARDS after a Fluent minimize (Enabled was still true), so
-    --     the first tap hid instead of showed.
-    -- New model: ONE boolean `hubVisible` is the single source of truth, flipped by the
-    -- green dot (and the minimize button). A permanent master loop then GUARANTEES the
-    -- on-screen result no matter what Fluent does:
-    --   1) continuously LEARNS the window's real full size while it is open & expanded,
-    --   2) forces ScreenGui.Enabled to match hubVisible (the always-reliable primitive),
-    --   3) while visible, INSTANTLY un-collapses the window every frame if Fluent ever
-    --      minimizes it -- forever, with no 14-frame limit and no auto-hide branch to
-    --      fight it, so the window can never get stuck closed,
-    --   4) defangs + overlays Fluent's own minimize button so it just toggles hubVisible.
-    -- Result: the dot OR the minimize button always reopens the FULL UI in one tap.
-    -- ===========================================================================
+    -- DEFINITIVE TOGGLE -- built from Fluent's ACTUAL source code.
+    -- Fluent's minimize is literally just:  Window.Root.Visible = not Window.Minimized
+    -- (a plain visibility flip on the window frame Window.Root -- NOT a size collapse).
+    -- So we control that exact property directly through the Window handle: no ScreenGui
+    -- heuristics, no geometry button-hunting, no size-learning, no guessing.
+    --   * show/hide/toggle just set Window.Root.Visible (+ keep Window.Minimized in sync).
+    --   * We re-point Fluent's own Window.Minimize at our toggle, so the native title-bar
+    --     minimize button (and the PC MinimizeKey) flow through the SAME single source of
+    --     truth instead of fighting us.
+    --   * A cheap heartbeat enforces Root.Visible == hubVisible so nothing can desync it.
+    -- The green dot lives in its own ScreenGui and always stays tappable to reopen the UI.
     local hubVisible = true
-    local hubRoot = nil
-    local hubFullSize = nil
-    local hubFullAbsY = 0
 
-    local function findWindowRoot(g)
-        if hubRoot and hubRoot.Parent == g then return hubRoot end
-        hubRoot = nil
-        local titleObj
-        for _, d in ipairs(g:GetDescendants()) do
-            if (d:IsA("TextLabel") or d:IsA("TextButton")) and typeof(d.Text) == "string" and (string.find(d.Text, "Nigga") or string.find(d.Text, "Ultimate Edition")) then
-                titleObj = d break
-            end
+    local function getRoot()
+        if Window and typeof(Window) == "table" then
+            local ok, r = pcall(function() return Window.Root end)
+            if ok and typeof(r) == "Instance" and r:IsA("GuiObject") then return r end
         end
-        if titleObj then
-            local node = titleObj
-            while node and node.Parent and node.Parent ~= g do node = node.Parent end
-            if node and node:IsA("GuiObject") then hubRoot = node end
-        end
-        if not hubRoot then hubRoot = g:FindFirstChildWhichIsA("Frame") end
-        return hubRoot
+        return nil
     end
 
-    local function showHub() hubVisible = true end
-    local function hideHub() hubVisible = false end
-    local function toggleHub() hubVisible = not hubVisible end
-
-    -- Best-effort: route Fluent's own minimize button to our toggle and defang its native
-    -- collapse. This never has to be perfect -- the master loop below is the real guarantee.
-    local function wireMinToggle(g, root)
-        if not g or not root then return end
-        local tCenterY = root.AbsolutePosition.Y + 18 -- the title bar sits at the very top of the window
-        local rightHalf = root.AbsolutePosition.X + root.AbsoluteSize.X * 0.5
-        local best, bestX = nil, -math.huge
-        for _, d in ipairs(g:GetDescendants()) do
-            if (d:IsA("ImageButton") or d:IsA("TextButton")) and d.Name ~= "NH_MinToggle" then
-                local sz = d.AbsoluteSize
-                local cY = d.AbsolutePosition.Y + sz.Y * 0.5
-                if sz.X > 0 and sz.X <= 70 and sz.Y <= 70
-                   and math.abs(cY - tCenterY) <= 30
-                   and d.AbsolutePosition.X > rightHalf then
-                    if d.AbsolutePosition.X > bestX then bestX = d.AbsolutePosition.X; best = d end
-                end
-            end
+    local function applyHub()
+        local r = getRoot()
+        if r then
+            pcall(function()
+                r.Visible = hubVisible
+                if Window then Window.Minimized = not hubVisible end
+            end)
         end
-        if not best then return end
-        if not best:FindFirstChild("NH_MinToggle") then
-            local ov = Instance.new("TextButton")
-            ov.Name = "NH_MinToggle"
-            ov.Size = UDim2.fromScale(1, 1)
-            ov.BackgroundTransparency = 1
-            ov.Text = ""
-            ov.AutoButtonColor = false
-            ov.Active = true
-            ov.ZIndex = (best.ZIndex or 1) + 100
-            ov.Parent = best
-            ov.Activated:Connect(toggleHub)
-            ov.MouseButton1Click:Connect(toggleHub)
-        end
-        pcall(function() best.Active = false; best.AutoButtonColor = false end)
     end
 
-    -- THE MASTER GUARANTEE LOOP -------------------------------------------------------
-    local minScan = 0
-    RunService.Heartbeat:Connect(function(dt)
-        local g = findHubGui()
-        if not g then return end
-        local root = findWindowRoot(g)
+    local function showHub() hubVisible = true; applyHub() end
+    local function hideHub() hubVisible = false; applyHub() end
+    local function toggleHub() hubVisible = not hubVisible; applyHub() end
 
-        -- 1) learn the real full size while the window is open & expanded
-        if hubVisible and root and root.Visible and root.AbsoluteSize.X > 140 and root.AbsoluteSize.Y > 140 then
-            hubFullSize = root.Size
-            hubFullAbsY = root.AbsoluteSize.Y
-        end
+    -- Route Fluent's OWN minimize (native button + PC MinimizeKey both call Window:Minimize())
+    -- through our toggle, so every native minimize path stays in sync with hubVisible.
+    pcall(function()
+        if Window then Window.Minimize = function() toggleHub() end end
+    end)
 
-        -- 2) visibility is driven purely by hubVisible
-        if g.Enabled ~= hubVisible then g.Enabled = hubVisible end
-
-        -- 3) while visible, INSTANTLY undo any Fluent collapse so it can never stick
-        if hubVisible and root and hubFullSize then
-            if (not root.Visible) or (hubFullAbsY > 0 and root.AbsoluteSize.Y < hubFullAbsY * 0.7) then
-                pcall(function()
-                    root.Visible = true
-                    root.Size = hubFullSize
-                end)
-            end
-        end
-
-        -- 4) keep Fluent's own minimize button defanged + overlaid (~3x/sec, cheap)
-        minScan = minScan + dt
-        if minScan >= 0.33 then
-            minScan = 0
-            pcall(wireMinToggle, g, root)
+    -- Enforcement loop: guarantee the real window frame always matches our flag, so a stray
+    -- Fluent action can never leave the UI stuck hidden or desynced.
+    RunService.Heartbeat:Connect(function()
+        local r = getRoot()
+        if r and r.Visible ~= hubVisible then
+            pcall(function() r.Visible = hubVisible end)
         end
     end)
-    -- (PC toggle is handled natively by Fluent's MinimizeKey = LeftControl, set at window
-    -- creation for a smooth native minimize. This mobile-only block needs no key handler.)
     dotBtn.InputBegan:Connect(function(i) 
         if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then 
             dotDrag = true; dotMoved = false; dotActiveInput = i; dotDragOr = i.Position; dotFrOr = dotFrame.Position; dotPressT = os.clock() 
