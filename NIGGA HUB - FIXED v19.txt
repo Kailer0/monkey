@@ -194,8 +194,12 @@ local function reassertControls()
 end
 if mobile then
     -- whenever the engine switches away from touch (caused by our synthetic input), restore
-    UserInputService:GetPropertyChangedSignal("LastInputType"):Connect(function()
-        if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then reassertControls() end
+    -- IMPORTANT: there is NO `UserInputService.LastInputType` property, so
+    -- GetPropertyChangedSignal("LastInputType") throws "LastInputType is not a valid
+    -- property name" on strict executors (Delta), which killed the whole script before
+    -- any UI built. The correct API is the LastInputTypeChanged event.
+    UserInputService.LastInputTypeChanged:Connect(function(lastType)
+        if (lastType or UserInputService:GetLastInputType()) ~= Enum.UserInputType.Touch then reassertControls() end
     end)
     -- backstop: if the master TouchGui ever gets flagged off, flip it back
     local function hookTouchGui()
@@ -2694,6 +2698,19 @@ local FLUENT_URLS = {
 	-- "https://raw.githubusercontent.com/<your-user>/<your-repo>/main/Fluent.lua", -- <-- recommended: your own raw mirror
 	"https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua",
 }
+-- Visible red banner. Delta mobile frequently does NOT render StarterGui:SetCore
+-- notifications, so a failed load looked like "nothing happens at all". This draws
+-- an actual on-screen label so load errors are visible on every executor.
+local function _bigError(msg)
+	pcall(function()
+		local g = Instance.new("ScreenGui")
+		g.Name = "HubLoadError"; g.ResetOnSpawn = false; g.IgnoreGuiInset = true; g.DisplayOrder = 999999
+		g.Parent = LocalPlayer:WaitForChild("PlayerGui")
+		local f = Instance.new("Frame"); f.Size = UDim2.new(1, 0, 0, 90); f.Position = UDim2.fromScale(0, 0); f.BackgroundColor3 = Color3.fromRGB(140, 0, 0); f.BorderSizePixel = 0; f.Parent = g
+		local t = Instance.new("TextLabel"); t.Size = UDim2.new(1, -20, 1, -10); t.Position = UDim2.fromOffset(10, 5); t.BackgroundTransparency = 1; t.TextColor3 = Color3.fromRGB(255, 255, 255); t.TextWrapped = true; t.Font = Enum.Font.GothamBold; t.TextSize = 16; t.Text = "[HUB ERROR] " .. tostring(msg); t.Parent = f
+		task.delay(15, function() pcall(function() g:Destroy() end) end)
+	end)
+end
 local function _httpGet(url)
 	for _ = 1, 3 do
 		local ok, body = pcall(function() return game:HttpGet(url, true) end)
@@ -2716,6 +2733,7 @@ local function _loadDep(name, urls)
 			end
 		end
 	end
+	_bigError(name .. " could not download. Most mobile executors (Delta) block the GitHub release REDIRECT. Mirror " .. name .. " to your OWN raw.githubusercontent.com link and put it first in FLUENT_URLS.")
 	notify("Load Failed", name .. " couldn't download. Your mobile executor likely blocks GitHub redirects/HttpGet. Host it on your own raw GitHub/pastebin link.", 10)
 	error("[Hub] dependency load failed: " .. name)
 end
