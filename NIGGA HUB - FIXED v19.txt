@@ -1205,13 +1205,12 @@ do
         return st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping
     end
     local function resolveDS()
-        local c = LocalPlayer.Character
-        local mv = c and c:GetAttribute("Moveset")
-        if not mv then dsRemote = nil return end
+        -- The combo FINISHER is NOT on the moveset service -- it's a single shared
+        -- remote: CustomService.RE.Activated:FireServer(direction), where direction is
+        -- false/nil (neutral), "Down" (downslam) or "Up" (upslam). The old code hooked
+        -- the wrong remote, which is why mobile downslam did nothing.
         local ok, re = pcall(function()
-            local svc = ReplicatedStorage.Knit.Knit.Services:FindFirstChild(mv .. "Service")
-            local reF = svc and svc:FindFirstChild("RE")
-            return reF and reF:FindFirstChild("Activated")
+            return ReplicatedStorage.Knit.Knit.Services.CustomService.RE.Activated
         end)
         dsRemote = ok and re or nil
     end
@@ -1245,36 +1244,30 @@ do
         if St.autoDownslamEnabled and not dsRefiring and self == dsRemote and getnamecallmethod() == "FireServer" then
             local a = { ... }
             local d = a[1]
-            -- arg1 of the combo finisher is the DIRECTION ("Up"/"Down"/false/nil).
-            -- Regular M1s use a different remote, so reaching here = the finisher. We
-            -- broaden the match because the MOBILE client sends a different default
-            -- direction than PC -- that mismatch is one reason an "identical" rewrite
-            -- worked on PC but did nothing on mobile.
-            if d == false or d == nil or d == "Up" or d == "Down" then
-                local tgt = a[2]
+            -- arg1 of the finisher is the DIRECTION: false/nil = neutral, "Down" =
+            -- downslam, "Up" = upslam. Only convert a NEUTRAL finisher into a downslam;
+            -- leave an explicit "Up"/"Down" the user fired themselves untouched.
+            if d == false or d == nil then
                 local ch = LocalPlayer.Character
                 local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-                local hrp = ch and (ch.PrimaryPart or ch:FindFirstChild("HumanoidRootPart"))
-                -- The SERVER only accepts a downslam while AIRBORNE. On PC your combo
-                -- already leaves you off the ground at the finisher; on mobile it usually
-                -- doesn't -- THAT is the real reason mobile downslam "does nothing". If
-                -- grounded: do a quick natural hop, wait until actually airborne, THEN send
-                -- the Down finisher (swallow the grounded send, re-send it in the air).
-                -- Only ever runs on the finisher (one fire per combo), so it can't spam M1s.
-                if hum and hrp and not dsAirborne(hum) then
+                -- The SERVER only accepts a "Down" finisher while AIRBORNE. On PC the
+                -- combo already pops you off the ground by the finisher; on mobile it
+                -- usually doesn't -- THAT is the real reason mobile downslam did nothing.
+                -- If grounded: hop, wait until actually airborne, THEN fire "Down"
+                -- (swallow the grounded send, re-fire in the air). One fire per combo.
+                if hum and not dsAirborne(hum) then
                     dsRefiring = true
                     task.spawn(function()
                         dsLiftOff(ch, hum)
                         local t0 = os.clock()
                         repeat RunService.Heartbeat:Wait() until dsAirborne(hum) or (os.clock() - t0) > 1.0
-                        pcall(function() oldDS(dsRemote, "Down", tgt) end)
+                        pcall(function() oldDS(dsRemote, "Down") end)
                         task.wait(0.05)
                         dsRefiring = false
                     end)
                     return
                 end
-                a[1] = "Down"
-                return oldDS(self, unpack(a))
+                return oldDS(self, "Down")
             end
         end
         return oldDS(self, ...)
@@ -1401,8 +1394,25 @@ do
         hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir.Unit)
     end
 
+    local lastAutoM1 = 0
     local function triggerM1()
-        if AttackActivated then
+        lastAutoM1 = os.clock()
+        -- This game has NO AttackService/CombatService, so AttackActivated was always
+        -- nil and the synthetic-mouse fallback ALWAYS ran -- flipping LastInputType off
+        -- Touch and killing the mobile joystick. M1 is really the moveset's own remote:
+        -- <Moveset>Service.RE.Activated:FireServer(movesetInstance)  (no arg2 = plain M1).
+        local ch = player.Character
+        local mvName = ch and ch:GetAttribute("Moveset")
+        local container = ch and ch:FindFirstChild("Moveset")
+        local mi = container and ((mvName and container:FindFirstChild(mvName)) or container:GetChildren()[1])
+        local re = nil
+        if mvName then
+            local ok, r = pcall(function() return Knit.Services[(mvName:gsub("%s", "")) .. "Service"].RE.Activated end)
+            re = ok and r or nil
+        end
+        if re and mi then
+            pcall(function() re:FireServer(mi) end)
+        elseif AttackActivated then
             AttackActivated:FireServer()
         else
             local cam = workspace.CurrentCamera
@@ -1413,6 +1423,8 @@ do
             VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
             task.wait(0.02)
             VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            -- last-resort synthetic mouse: restore touch controls right after.
+            if mobile and restoreTouchControls then restoreTouchControls() end
         end
     end
 
@@ -1421,7 +1433,7 @@ do
     local countingDown = false
 
     RunService.Heartbeat:Connect(function()
-        if not St.autoBlockEnabled then return end
+        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
         ping = player:GetNetworkPing()
     end)
 
@@ -1483,7 +1495,8 @@ do
     local attackerDebounce = {}
 
     local function onM1(attacker)
-        if not St.autoBlockEnabled then return end
+        -- Run when EITHER autoblock OR autopunish is on, so punish works standalone.
+        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
         if typeof(attacker) ~= "Instance" or not attacker:IsA("Model") then return end
         if attacker == player.Character then return end
         local myChar = player.Character
@@ -1499,8 +1512,10 @@ do
         task.delay(0.12, function() attackerDebounce[attacker] = nil end)
 
         faceTarget(theirHRP)
-        getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
-        forceStartBlock()
+        if St.autoBlockEnabled then
+            getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
+            forceStartBlock()
+        end
 
         task.spawn(attemptCounter, theirHRP)
     end
@@ -1539,7 +1554,7 @@ do
             if eff and (eff:IsA("RemoteEvent") or eff:IsA("UnreliableRemoteEvent")) then
                 pcall(function()
                     eff.OnClientEvent:Connect(function(effectType, arg2, arg3)
-                        if not St.autoBlockEnabled then return end
+                        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
                         if type(effectType) ~= "string" then return end
                         if effectType == "Swing" or effectType == "Swing2" then
                             onM1(arg2)
@@ -1555,7 +1570,7 @@ do
                                 local vel = arg2.Velocity
                                 if vel.Magnitude < 1 then return end
                                 if vel.Unit:Dot(toMe.Unit) > 0.85 and toMe.Magnitude < 150 then
-                                    if not getgenv().blockState.active then
+                                    if St.autoBlockEnabled and not getgenv().blockState.active then
                                         getgenv().blockState.holdFrames = 20
                                         forceStartBlock()
                                     end
@@ -1571,7 +1586,7 @@ do
     local animDebounce = {}
 
     RunService.Heartbeat:Connect(function()
-        if not St.autoBlockEnabled then return end
+        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
         local myChar = player.Character
         if not myChar then return end
         if myChar:GetAttribute("Ragdoll") ~= 0 then return end
@@ -1616,8 +1631,10 @@ do
                     task.delay(track.Length, function() animDebounce[key] = nil end)
 
                     faceTarget(theirHRP)
-                    getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
-                    forceStartBlock()
+                    if St.autoBlockEnabled then
+                        getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
+                        forceStartBlock()
+                    end
 
                     task.spawn(attemptCounter, theirHRP)
                 end
@@ -1800,6 +1817,11 @@ do
     local lastBlockBreak = 0
     local function tryBlockBreak()
         if not St.autoBlockBreakEnabled then return end
+        -- Ignore M1s that WE fired programmatically (auto punish, or this feature's own
+        -- follow-up M1). Without this, an auto-punish M1 plays the M1 animation, which
+        -- re-triggered this and made the hub dash-behind + block-break ON ITS OWN with no
+        -- real button press. Only a genuine user M1 should ever start a block break.
+        if os.clock() - lastAutoM1 < 0.35 then return end
         if blockBreakBusy then return end
         if type(_G.NH_dashBehind) ~= "function" then return end
         local now = os.clock()
@@ -2439,10 +2461,36 @@ local function bfFireCharged(effTime, target, skipOrient)
                 end
             end)
         end
-        -- HIT 1 (charge)
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-        task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+        -- Fire the move remote DIRECTLY instead of synthesizing KeyCode.Three. Synthetic
+        -- keys flip LastInputType off Touch -> Roblox hides the mobile joystick (the whole
+        -- reason the BF chain nuked it). M1/Divergent = <Moveset>Service.RE.Activated:
+        -- FireServer(movesetInstance, bfBool); bfBool=false normal, true = Black Flash.
+        local function nhMI()
+            local ch = player.Character
+            local container = ch and ch:FindFirstChild("Moveset")
+            if not container then return nil end
+            local mvName = ch:GetAttribute("Moveset")
+            return (mvName and container:FindFirstChild(mvName)) or container:GetChildren()[1]
+        end
+        local function nhRE()
+            local ch = player.Character
+            local mvName = ch and ch:GetAttribute("Moveset")
+            if not mvName then return nil end
+            local ok, re = pcall(function() return ReplicatedStorage.Knit.Knit.Services[(mvName:gsub("%s", "")) .. "Service"].RE.Activated end)
+            return ok and re or nil
+        end
+        -- HIT 1 (charge) -- normal Divergent Fist (advances combo)
+        do
+            local re, mi = nhRE(), nhMI()
+            if re and mi then
+                pcall(function() re:FireServer(mi, false) end)
+                task.wait(BF.HOLD)
+            else
+                VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+                task.wait(BF.HOLD)
+                VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+            end
+        end
         if mobile then restoreTouchControls() end
         -- wait the golden interval (down-to-down = effTime), precise at the end
         local target_t = os.clock() + (effTime - BF.HOLD)
@@ -2450,10 +2498,18 @@ local function bfFireCharged(effTime, target, skipOrient)
             RunService.Heartbeat:Wait()
         end
         while bfActive and os.clock() < target_t do end
-        -- HIT 2 (release the flash)
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-        task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+        -- HIT 2 (release the flash) -- Black Flash variant: bool = true
+        do
+            local re, mi = nhRE(), nhMI()
+            if re and mi then
+                pcall(function() re:FireServer(mi, true) end)
+                task.wait(BF.HOLD)
+            else
+                VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+                task.wait(BF.HOLD)
+                VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+            end
+        end
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
         if mobile then restoreTouchControls() end
         -- tear down the per-frame guard shortly after the flash, with a final restore pass
