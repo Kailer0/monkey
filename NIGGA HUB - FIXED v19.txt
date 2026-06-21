@@ -2758,7 +2758,7 @@ local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.
 local Window = Fluent:CreateWindow({
     Title = "Nigga Hub", SubTitle = "Ultimate Edition", TabWidth = 130,
     Size = mobile and UDim2.fromOffset(math.clamp(Camera.ViewportSize.X * 0.92, 300, 540), math.clamp(Camera.ViewportSize.Y * 0.80, 300, 460)) or UDim2.fromOffset(600, 480),
-    Acrylic = not mobile, Theme = "Dark", MinimizeKey = Enum.KeyCode.Unknown
+    Acrylic = not mobile, Theme = "Dark", MinimizeKey = (mobile and Enum.KeyCode.Unknown or Enum.KeyCode.LeftControl)
 })
 
 local Tabs = {
@@ -3064,8 +3064,9 @@ else
     end
     mbBtn("MbSweep", "Show Sweep Button", "SweepBtn")
     mbBtn("MbHunt", "Show Hunt Button", "HuntBtn")
-    mbBtn("MbBF", "Show BF Dash Button", "BFBtn")
-    mbBtn("MbFly", "Show Fly Button", "FlyBtn")
+    -- (Removed the mobile "Show Fly Button" and "Show BF Button" quick-access toggles:
+    --  Fly and Black Flash already have dedicated float buttons that appear automatically
+    --  when their feature is enabled, so these were redundant.)
     mbBtn("MbLock", "Show Lock-On Button", "LockBtn")
     mbBtn("MbYonk", "Show Yonk Button", "YonkBtn")
     mbBtn("MbEmote", "Show Emote Button", "EmoteBtn")
@@ -3234,7 +3235,18 @@ if mobile then
     --    (from the menu/green UI dot). When the feature turns off, its button hides.
     --    EMOTE is an instant tap-to-fire button (no on/off); it shows when you enable it in Settings.
     local flyGui = createFloatButton("FlyBtn", "FLY", vp.X-80, vp.Y-160, Color3.fromRGB(30,100,30), Color3.fromRGB(80,255,80), function()
-        if Fluent.Options.TglFly then Fluent.Options.TglFly:SetValue(not Fluent.Options.TglFly.Value); return Fluent.Options.TglFly.Value end return false
+        -- FLY starts/stops the actual flight MOTION only. It does NOT disable the
+        -- "Enable Fly" feature, so your UP / DOWN / BOOST control icons STAY on screen
+        -- after you unfly -- they only disappear when you turn OFF "Enable Fly" in the menu.
+        if not St.flyToggleOn then
+            if Fluent.Options.TglFly then Fluent.Options.TglFly:SetValue(true) end
+            return true
+        end
+        if St.flyActive then
+            St.flyActive = false; disableFly(); return false
+        else
+            St.flyActive = true; enableFly(); return true
+        end
     end, false)
 
     local bfGui = createFloatButton("BFBtn", "BF", vp.X-160, vp.Y-160, Color3.fromRGB(160,80,255), Color3.fromRGB(255,200,50), function()
@@ -3302,7 +3314,7 @@ if mobile then
     -- Per-feature visibility: a button is only shown while its feature is active.
     -- _G.mainOverlayMaster (Settings > Show Main Controls) can hide everything at once.
     local featureVisible = {
-        {gui = flyGui,   on = function() return St.flyActive end},
+        {gui = flyGui,   on = function() return St.flyToggleOn end},
         {gui = bfGui,    on = function() return St.bfEnabled end},
         {gui = lockGui,  on = function() return St.lockOnEnabled end},
         {gui = sweepGui, on = function() return St.sweepActive end},
@@ -3412,17 +3424,30 @@ if mobile then
     --      shrunk) and converts it into our OWN clean hide -- so the dot always
     --      reopens the FULL window in one tap, no matter how it was minimized.
     -- ===========================================================================
-    local hubRoot, hubFullSize, hubFullAbsY = nil, nil, 0
+    local hubRoot, hubFullSize, hubFullAbsY, hubFullAbsX = nil, nil, 0, 0
     local hubEverFull = false
     local hubUserHidden = false
 
     local function ensureHubRefs()
         local g = findHubGui()
         if not g then return nil end
-        -- Fluent's window body is the direct child Frame of its ScreenGui; that is the
-        -- frame Fluent resizes/hides when it minimizes.
         if not hubRoot or not hubRoot.Parent or hubRoot.Parent ~= g then
-            hubRoot = g:FindFirstChildWhichIsA("Frame")
+            -- The window body is the gui's direct child that CONTAINS the title text.
+            -- Picking the title's top-level ancestor is FAR more reliable than grabbing
+            -- the first Frame, which can be a full-screen acrylic/background layer that
+            -- never changes when Fluent minimizes -- THAT is why minimize detection failed.
+            local titleObj
+            for _, d in ipairs(g:GetDescendants()) do
+                if (d:IsA("TextLabel") or d:IsA("TextButton")) and typeof(d.Text) == "string" and (string.find(d.Text, "Nigga") or string.find(d.Text, "Ultimate Edition")) then
+                    titleObj = d break
+                end
+            end
+            if titleObj then
+                local node = titleObj
+                while node and node.Parent and node.Parent ~= g do node = node.Parent end
+                if node and node:IsA("GuiObject") then hubRoot = node end
+            end
+            if not hubRoot or not hubRoot:IsA("GuiObject") then hubRoot = g:FindFirstChildWhichIsA("Frame") end
         end
         return g
     end
@@ -3468,13 +3493,13 @@ if mobile then
         local g = ensureHubRefs()
         if not g or not hubRoot then return end
         if hubUserHidden or not g.Enabled then return end
-        local absY = hubRoot.AbsoluteSize.Y
-        if hubRoot.Visible and absY > 90 then
+        local absY, absX = hubRoot.AbsoluteSize.Y, hubRoot.AbsoluteSize.X
+        if hubRoot.Visible and absY > 90 and absX > 90 then
             -- fully expanded -> remember this as the real full size
             hubFullSize = hubRoot.Size
-            hubFullAbsY = absY
+            hubFullAbsY = absY; hubFullAbsX = absX
             hubEverFull = true
-        elseif hubEverFull and ((not hubRoot.Visible) or (hubFullAbsY > 0 and absY < hubFullAbsY * 0.6)) then
+        elseif hubEverFull and ((not hubRoot.Visible) or (hubFullAbsY > 0 and absY < hubFullAbsY * 0.6) or (hubFullAbsX > 0 and absX < hubFullAbsX * 0.6)) then
             -- it was full and is now collapsed even though WE didn't hide it =>
             -- Fluent minimized it. Convert into our clean hide (dot will reopen full).
             hubUserHidden = true
@@ -3511,15 +3536,8 @@ if mobile then
         end
     end
     for _, t in ipairs({0.5, 1, 2, 3, 5}) do task.delay(t, wireMinimizeButton) end
-    -- PC keybind preserved: RightControl toggles the hub through the SAME unified path as
-    -- the green dot and the in-UI minimize button, so all three stay in sync and can never
-    -- desync. Fluent's own MinimizeKey is set to Unknown above so this is the ONLY handler
-    -- for RightControl (no double-toggle, no Fluent native collapse).
-    pcall(function()
-        UserInputService.InputBegan:Connect(function(input)
-            if input.KeyCode == Enum.KeyCode.RightControl then toggleHub() end
-        end)
-    end)
+    -- (PC toggle is handled natively by Fluent's MinimizeKey = LeftControl, set at window
+    -- creation for a smooth native minimize. This mobile-only block needs no key handler.)
     dotBtn.InputBegan:Connect(function(i) 
         if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then 
             dotDrag = true; dotMoved = false; dotActiveInput = i; dotDragOr = i.Position; dotFrOr = dotFrame.Position; dotPressT = os.clock() 
