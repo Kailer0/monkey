@@ -2758,7 +2758,7 @@ local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.
 local Window = Fluent:CreateWindow({
     Title = "Nigga Hub", SubTitle = "Ultimate Edition", TabWidth = 130,
     Size = mobile and UDim2.fromOffset(math.clamp(Camera.ViewportSize.X * 0.92, 300, 540), math.clamp(Camera.ViewportSize.Y * 0.80, 300, 460)) or UDim2.fromOffset(600, 480),
-    Acrylic = not mobile, Theme = "Dark", MinimizeKey = Enum.KeyCode.RightControl
+    Acrylic = not mobile, Theme = "Dark", MinimizeKey = (mobile and Enum.KeyCode.Unknown or Enum.KeyCode.LeftControl)
 })
 
 local Tabs = {
@@ -3481,36 +3481,74 @@ if mobile then
         g.Enabled = false
     end
 
-    -- THE FIX YOU ASKED FOR: the UI toggle now does EXACTLY what the PC keybind does --
-    -- it fires the same minimize key (RightControl) that Fluent listens to, so FLUENT runs
-    -- its OWN native minimize/restore. That native restore is the thing that always worked
-    -- on PC; we were failing before because we tried to rebuild restore ourselves. Firing a
-    -- key does NOT touch the mobile joysticks / touch controls, so nothing disappears.
-    local function pressMinimizeKey()
-        local ok = false
-        pcall(function()
-            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.RightControl, false, game)
-            task.wait()
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.RightControl, false, game)
-            ok = true
-        end)
-        return ok
-    end
-
     local function toggleHub()
-        -- imitate the PC RightControl press -> Fluent natively toggles minimize/restore
-        if pressMinimizeKey() then return end
-        -- ultra-safe fallback only if SendKeyEvent is ever blocked by the executor
         local g = ensureHubRefs()
         if not g then return end
-        g.Enabled = not g.Enabled
+        if g.Enabled and not hubUserHidden then hideHub() else showHub() end
     end
 
-    -- Fluent's native minimize button is left fully intact now: tapping it runs Fluent's
-    -- own minimize, and the green dot below restores it by firing the SAME RightControl key
-    -- (see pressMinimizeKey/toggleHub above). Both paths go through Fluent's native
-    -- minimize/restore, so they can never desync and the window always comes back clean.
-    -- (No more name/geometry hunting for the button and no more rebuilding restore.)
+    -- ===========================================================================
+    -- UI TOGGLE *ON TOP OF* THE MINIMIZE BUTTON (mobile) -- the approach you asked for,
+    -- finally done right. The two real reasons it failed before are both fixed:
+    --   (1) WRONG BUTTON: we used to guess the window frame and search from there. The
+    --       guess was wrong, so detection found nothing. Now we anchor to the TITLE TEXT
+    --       (we can always find that) and grab the small button on the SAME ROW, to its
+    --       RIGHT -- that is the minimize button, every Fluent build.
+    --   (2) WRONG LAYER: a separate top ScreenGui did NOT block the tap, because Fluent
+    --       draws in CoreGui/gethui ABOVE a PlayerGui overlay -- so Fluent's button still
+    --       got the tap and natively collapsed the window (which our show couldn't undo).
+    --       Now the transparent toggle is parented AS A CHILD of the minimize button with
+    --       a higher ZIndex, so it lives in Fluent's OWN layer and reliably eats the tap.
+    -- The tap routes to our clean hide/show (ScreenGui.Enabled). Fluent never collapses
+    -- the window, so it always reopens FULL. Tapping it == tapping the green dot.
+    -- ===========================================================================
+    local function findTitleObj(g)
+        for _, d in ipairs(g:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and typeof(d.Text) == "string" and (string.find(d.Text, "Nigga") or string.find(d.Text, "Ultimate Edition")) then
+                return d
+            end
+        end
+    end
+    local function wireMinToggle()
+        local g = findHubGui()
+        if not g then return end
+        local title = findTitleObj(g)
+        if not title then return end
+        local tY = title.AbsolutePosition.Y + title.AbsoluteSize.Y * 0.5  -- title-bar row center
+        local tX = title.AbsolutePosition.X
+        local best, bestX = nil, -math.huge
+        for _, d in ipairs(g:GetDescendants()) do
+            if (d:IsA("ImageButton") or d:IsA("TextButton")) and d.Name ~= "NH_MinToggle" and not d:FindFirstChild("NH_MinToggle") then
+                local sz = d.AbsoluteSize
+                local cY = d.AbsolutePosition.Y + sz.Y * 0.5
+                if sz.X > 0 and sz.X <= 64 and sz.Y <= 64                  -- a small control, not a panel
+                   and math.abs(cY - tY) <= 26                             -- same row as the title text
+                   and d.AbsolutePosition.X > tX then                      -- sits to the RIGHT of the title
+                    if d.AbsolutePosition.X > bestX then bestX = d.AbsolutePosition.X; best = d end
+                end
+            end
+        end
+        if not best then return end
+        if not best:FindFirstChild("NH_MinToggle") then
+            local ov = Instance.new("TextButton")
+            ov.Name = "NH_MinToggle"
+            ov.Size = UDim2.fromScale(1, 1)
+            ov.Position = UDim2.fromScale(0, 0)
+            ov.BackgroundTransparency = 1
+            ov.Text = ""
+            ov.AutoButtonColor = false
+            ov.Active = true
+            ov.ZIndex = (best.ZIndex or 1) + 100
+            ov.Parent = best
+            ov.Activated:Connect(function() toggleHub() end)
+            ov.MouseButton1Click:Connect(function() toggleHub() end)
+        end
+        -- belt & suspenders: defang the native minimize so even a missed tap can't collapse it
+        pcall(function() best.Active = false; best.AutoButtonColor = false end)
+    end
+    -- keep it wired: a few initial passes + a light re-check (Fluent can rebuild its title bar)
+    for _, t in ipairs({0.3, 0.8, 1.5, 3, 5}) do task.delay(t, wireMinToggle) end
+    task.spawn(function() while true do task.wait(2); pcall(wireMinToggle) end end)
     -- (PC toggle is handled natively by Fluent's MinimizeKey = LeftControl, set at window
     -- creation for a smooth native minimize. This mobile-only block needs no key handler.)
     dotBtn.InputBegan:Connect(function(i) 
