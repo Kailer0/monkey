@@ -1166,17 +1166,40 @@ do
     LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
 
     local oldDS
+    local dsRefiring = false
     oldDS = hookmetamethod(game, "__namecall", function(self, ...)
-        if St.autoDownslamEnabled and self == dsRemote and getnamecallmethod() == "FireServer" then
+        if St.autoDownslamEnabled and not dsRefiring and self == dsRemote and getnamecallmethod() == "FireServer" then
             local a = { ... }
-            -- Convert the combo finisher into a downslam by rewriting the direction
-            -- arg (false/nil -> "Down"), EXACTLY like the original working snippet.
-            -- IDENTICAL on PC and mobile -- you asked for the same version on both.
-            -- Only the finisher reaches this remote (regular M1s use a different one),
-            -- so this never wastes hits. The previous mobile-only "pop into the air +
-            -- suppress the hit" branch is what was breaking mobile downslam, so it has
-            -- been removed entirely.
-            if a[1] == false or a[1] == nil then
+            local d = a[1]
+            -- arg1 of the combo finisher is the DIRECTION ("Up"/"Down"/false/nil).
+            -- Regular M1s use a different remote, so reaching here = the finisher. We
+            -- broaden the match because the MOBILE client sends a different default
+            -- direction than PC -- that mismatch is one reason an "identical" rewrite
+            -- worked on PC but did nothing on mobile.
+            if d == false or d == nil or d == "Up" or d == "Down" then
+                local tgt = a[2]
+                local ch = LocalPlayer.Character
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                local hrp = ch and (ch.PrimaryPart or ch:FindFirstChild("HumanoidRootPart"))
+                -- The SERVER only accepts a downslam while AIRBORNE. On PC your combo
+                -- already leaves you off the ground at the finisher; on mobile it usually
+                -- doesn't -- THAT is the real reason mobile downslam "does nothing". If
+                -- grounded: do a quick natural hop, wait until actually airborne, THEN send
+                -- the Down finisher (swallow the grounded send, re-send it in the air).
+                -- Only ever runs on the finisher (one fire per combo), so it can't spam M1s.
+                if hum and hrp and hum.FloorMaterial ~= Enum.Material.Air then
+                    dsRefiring = true
+                    task.spawn(function()
+                        pcall(function() hum.Jump = true end)
+                        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                        local t0 = os.clock()
+                        repeat RunService.Heartbeat:Wait() until hum.FloorMaterial == Enum.Material.Air or (os.clock() - t0) > 0.35
+                        pcall(function() oldDS(dsRemote, "Down", tgt) end)
+                        task.wait(0.05)
+                        dsRefiring = false
+                    end)
+                    return
+                end
                 a[1] = "Down"
                 return oldDS(self, unpack(a))
             end
@@ -2322,10 +2345,26 @@ local function bfFireCharged(effTime, target, skipOrient)
         if mobile and target then
             faceCharToTarget()
         end
+        -- MOBILE: keep the on-screen joystick + jump button ALIVE for the ENTIRE flash.
+        -- Each synthetic move key flips LastInputType to keyboard, which makes Roblox hide
+        -- the touch controls. One restore AFTER the chain wasn't enough (the 2nd key, and
+        -- any re-chain, hid them again). So we run a throttled per-frame guard for the whole
+        -- flash that re-shows the controls the instant they vanish, AND restore right after
+        -- EVERY key release.
+        local bfTouchGuard, bfGuardLast = nil, 0
+        if mobile then
+            bfTouchGuard = RunService.Heartbeat:Connect(function()
+                if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then
+                    local now = os.clock()
+                    if now - bfGuardLast > 0.08 then bfGuardLast = now; restoreTouchControls() end
+                end
+            end)
+        end
         -- HIT 1 (charge)
         VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
         task.wait(BF.HOLD)
         VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+        if mobile then restoreTouchControls() end
         -- wait the golden interval (down-to-down = effTime), precise at the end
         local target_t = os.clock() + (effTime - BF.HOLD)
         while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
@@ -2337,9 +2376,14 @@ local function bfFireCharged(effTime, target, skipOrient)
         task.wait(BF.HOLD)
         VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
-        -- the flash keys above flipped LastInputType to keyboard on mobile; force the
-        -- joystick + jump button straight back so the chain never steals movement UI
-        if mobile then reassertControls() end
+        if mobile then restoreTouchControls() end
+        -- tear down the per-frame guard shortly after the flash, with a final restore pass
+        if bfTouchGuard then
+            task.delay(0.4, function()
+                if bfTouchGuard then bfTouchGuard:Disconnect(); bfTouchGuard = nil end
+                if mobile then reassertControls() end
+            end)
+        end
         -- restore AutoRotate (the no-shift-lock fallback may have disabled it)
         do
             local fch = getCharacter()
@@ -2670,7 +2714,7 @@ local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.
 local Window = Fluent:CreateWindow({
     Title = "Nigga Hub", SubTitle = "Ultimate Edition", TabWidth = 130,
     Size = mobile and UDim2.fromOffset(360, 320) or UDim2.fromOffset(600, 480),
-    Acrylic = not mobile, Theme = "Dark", MinimizeKey = Enum.KeyCode.RightControl
+    Acrylic = not mobile, Theme = "Dark", MinimizeKey = Enum.KeyCode.Unknown
 })
 
 local Tabs = {
@@ -3287,6 +3331,48 @@ if mobile then
         end
         return cachedHubGui
     end
+    -- UNIFIED HUB TOGGLE: show/hide the entire hub via ScreenGui.Enabled. No Fluent
+    -- minimize, no synthetic keys -> identical on PC + mobile and never touches the
+    -- joystick. The green dot AND Fluent's in-UI minimize button both run THIS, so they
+    -- are always in sync (that pairing is exactly what you asked for).
+    local function toggleHub()
+        local g = findHubGui()
+        if not g then return end
+        g.Enabled = not g.Enabled
+    end
+    -- Re-route Fluent's own in-UI minimize button to toggleHub and kill its native
+    -- minimize, so the window can never get stuck in Fluent's collapsed state -- that
+    -- collapsed state is exactly why the dot couldn't reopen the hub after you minimized
+    -- from the hub's own button.
+    task.delay(1, function()
+        local g = findHubGui()
+        if not g then return end
+        for _, d in ipairs(g:GetDescendants()) do
+            if (d:IsA("ImageButton") or d:IsA("TextButton")) and typeof(d.Name) == "string" and string.find(string.lower(d.Name), "minimize") then
+                local disabled = false
+                pcall(function()
+                    if getconnections then
+                        for _, c in ipairs(getconnections(d.MouseButton1Click)) do pcall(function() c:Disable() end); disabled = true end
+                        for _, c in ipairs(getconnections(d.Activated)) do pcall(function() c:Disable() end); disabled = true end
+                    end
+                end)
+                if disabled then
+                    pcall(function() d.MouseButton1Click:Connect(toggleHub) end)
+                    pcall(function() d.Activated:Connect(toggleHub) end)
+                end
+                break
+            end
+        end
+    end)
+    -- PC keybind preserved: RightControl toggles the hub through the SAME unified path as
+    -- the green dot and the in-UI minimize button, so all three stay in sync and can never
+    -- desync. Fluent's own MinimizeKey is set to Unknown above so this is the ONLY handler
+    -- for RightControl (no double-toggle, no Fluent native collapse).
+    pcall(function()
+        UserInputService.InputBegan:Connect(function(input)
+            if input.KeyCode == Enum.KeyCode.RightControl then toggleHub() end
+        end)
+    end)
     dotBtn.InputBegan:Connect(function(i) 
         if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then 
             dotDrag = true; dotMoved = false; dotActiveInput = i; dotDragOr = i.Position; dotFrOr = dotFrame.Position 
@@ -3320,13 +3406,7 @@ if mobile then
                 -- dot "did nothing" after you minimized from the hub. We know synthetic keys
                 -- register on this executor because the BF move key works; Fluent listens
                 -- for this keybind via UserInputService.InputBegan, so it always toggles.
-                local g = findHubGui()
-                if g and not g.Enabled then g.Enabled = true end -- heal any stale Enabled=false
-                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.RightControl, false, game)
-                task.wait()
-                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.RightControl, false, game)
-                -- the keybind briefly flips LastInputType off Touch -> heal the joystick
-                if mobile then reassertControls() end
+                toggleHub()
             end
         end 
     end)
