@@ -3487,55 +3487,80 @@ if mobile then
         if g.Enabled and not hubUserHidden then hideHub() else showHub() end
     end
 
-    -- Watcher: learn the full size while open, and convert Fluent's native minimize
-    -- (frame hidden OR shrunk) into our clean hide so the dot can restore it.
+    -- ===========================================================================
+    -- NUCLEAR MINIMIZE OVERRIDE (mobile): we do NOT try to undo Fluent's minimize
+    -- after the fact (that failed -- the window stayed collapsed and the dot couldn't
+    -- bring it back). Instead we KILL Fluent's native minimize button backend and turn
+    -- that button into a plain UI toggle. Result: Fluent NEVER collapses the window, so
+    -- SHOWING the UI is just ScreenGui.Enabled = true -- which you confirmed already works.
+    --
+    -- Finding the button WITHOUT its name: the minimize button is the small interactive
+    -- button in the window's TOP-RIGHT title-bar band. We find it by geometry, disable it
+    -- so its native handler can never fire, and float our own transparent toggle button
+    -- exactly on top of it at the highest DisplayOrder so the tap is OURS.
+    -- ===========================================================================
+    local minOverlayGui = Instance.new("ScreenGui")
+    minOverlayGui.Name = "NHMinToggleOverlay"
+    minOverlayGui.ResetOnSpawn = false
+    minOverlayGui.IgnoreGuiInset = true
+    minOverlayGui.DisplayOrder = 2000000
+    pcall(function() minOverlayGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end)
+    local minOverlayBtn = Instance.new("TextButton")
+    minOverlayBtn.Name = "NHMinToggleBtn"
+    minOverlayBtn.BackgroundTransparency = 1
+    minOverlayBtn.Text = ""
+    minOverlayBtn.AutoButtonColor = false
+    minOverlayBtn.Active = true
+    minOverlayBtn.Selectable = false
+    minOverlayBtn.Visible = false
+    minOverlayBtn.ZIndex = 50
+    minOverlayBtn.Parent = minOverlayGui
+    minOverlayBtn.Activated:Connect(function() toggleHub() end)
+
+    local trackedMinBtn = nil
+    local function looksLikeMinBtn(d, topY, leftX, width)
+        if not (d:IsA("ImageButton") or d:IsA("TextButton")) then return false end
+        if d == minOverlayBtn then return false end
+        if d:FindFirstAncestor("FluentUIToggleDot") then return false end
+        local ap, sz = d.AbsolutePosition, d.AbsoluteSize
+        if sz.X <= 0 or sz.Y <= 0 then return false end
+        if ap.Y < topY - 6 or ap.Y > topY + 56 then return false end   -- top title-bar band only
+        if ap.X < leftX + width * 0.5 then return false end            -- right half (minimize lives top-right)
+        if sz.X > width * 0.5 then return false end                     -- a small control, not a wide bar
+        return true
+    end
+
     RunService.Heartbeat:Connect(function()
         local g = ensureHubRefs()
-        if not g or not hubRoot then return end
-        if hubUserHidden or not g.Enabled then return end
-        local absY, absX = hubRoot.AbsoluteSize.Y, hubRoot.AbsoluteSize.X
-        if hubRoot.Visible and absY > 90 and absX > 90 then
-            -- fully expanded -> remember this as the real full size
-            hubFullSize = hubRoot.Size
-            hubFullAbsY = absY; hubFullAbsX = absX
-            hubEverFull = true
-        elseif hubEverFull and ((not hubRoot.Visible) or (hubFullAbsY > 0 and absY < hubFullAbsY * 0.6) or (hubFullAbsX > 0 and absX < hubFullAbsX * 0.6)) then
-            -- it was full and is now collapsed even though WE didn't hide it =>
-            -- Fluent minimized it. Convert into our clean hide (dot will reopen full).
-            hubUserHidden = true
-            restoreHubWindow()
-            g.Enabled = false
-        end
-    end)
+        if not g or not g.Enabled or not hubRoot then minOverlayBtn.Visible = false; return end
+        -- learn full size while open (insurance for restoreHubWindow)
+        local absY = hubRoot.AbsoluteSize.Y
+        if hubRoot.Visible and absY > 90 then hubFullSize = hubRoot.Size; hubEverFull = true end
 
-    -- Bonus: on builds where we CAN find Fluent's minimize button, intercept it so the
-    -- window doesn't even flash its collapse. Harmless if not found -- the watcher above
-    -- is the real guarantee. Route it to hideHub (our clean hide), not Fluent's collapse.
-    local minimizeWired = false
-    local function wireMinimizeButton()
-        if minimizeWired then return end
-        local g = findHubGui()
-        if not g then return end
-        for _, d in ipairs(g:GetDescendants()) do
-            if (d:IsA("ImageButton") or d:IsA("TextButton")) and typeof(d.Name) == "string" and string.find(string.lower(d.Name), "minimize") then
-                if not d:FindFirstChild("NH_MinOverlay") then
-                    local ov = Instance.new("TextButton")
-                    ov.Name = "NH_MinOverlay"
-                    ov.Size = UDim2.fromScale(1, 1)
-                    ov.BackgroundTransparency = 1
-                    ov.Text = ""
-                    ov.AutoButtonColor = false
-                    ov.ZIndex = (d.ZIndex or 1) + 50
-                    ov.Active = true
-                    ov.Parent = d
-                    ov.Activated:Connect(function() hideHub() end)
+        local topY = hubRoot.AbsolutePosition.Y
+        local leftX = hubRoot.AbsolutePosition.X
+        local width = hubRoot.AbsoluteSize.X
+
+        if not trackedMinBtn or not trackedMinBtn.Parent or not looksLikeMinBtn(trackedMinBtn, topY, leftX, width) then
+            trackedMinBtn = nil
+            local bestX = -math.huge
+            for _, d in ipairs(g:GetDescendants()) do
+                if looksLikeMinBtn(d, topY, leftX, width) then
+                    if d.AbsolutePosition.X > bestX then bestX = d.AbsolutePosition.X; trackedMinBtn = d end
                 end
-                minimizeWired = true
-                break
             end
         end
-    end
-    for _, t in ipairs({0.5, 1, 2, 3, 5}) do task.delay(t, wireMinimizeButton) end
+
+        if trackedMinBtn and trackedMinBtn.Parent then
+            pcall(function() trackedMinBtn.Active = false; trackedMinBtn.AutoButtonColor = false end) -- kill native minimize
+            local ap, sz = trackedMinBtn.AbsolutePosition, trackedMinBtn.AbsoluteSize
+            minOverlayBtn.Position = UDim2.fromOffset(math.floor(ap.X - 8), math.floor(ap.Y - 8))
+            minOverlayBtn.Size = UDim2.fromOffset(math.floor(sz.X + 16), math.floor(sz.Y + 16))
+            minOverlayBtn.Visible = true
+        else
+            minOverlayBtn.Visible = false
+        end
+    end)
     -- (PC toggle is handled natively by Fluent's MinimizeKey = LeftControl, set at window
     -- creation for a smooth native minimize. This mobile-only block needs no key handler.)
     dotBtn.InputBegan:Connect(function(i) 
