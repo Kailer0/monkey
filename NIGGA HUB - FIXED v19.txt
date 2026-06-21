@@ -26,6 +26,7 @@ local _lastDomainRebuild = 0
 
 _G.mainFloatGuis = {}
 _G.flyFloatGuis = {}
+_G.NH_btnManual = {}
 
 _G.mainOverlayMaster = false
 _G.ToggleMainOverlay = function(v)
@@ -205,6 +206,21 @@ local function restoreTouchControls()
         local id = 91237
         VirtualInputManager:SendTouchEvent(id, Enum.UserInputState.Begin.Value, 3, 3)
         VirtualInputManager:SendTouchEvent(id, Enum.UserInputState.End.Value, 3, 3)
+    end)
+end
+-- LIGHTWEIGHT per-frame force: just flips the master TouchGui + the thumbstick/jump frame
+-- back on. Cheap enough to call every RenderStepped frame (no require, no SendTouchEvent),
+-- which is the only way to keep the controls from blinking out while we spam synthetic keys.
+local function forceTouchVisible()
+    if not mobile then return end
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        local tg = pg and pg:FindFirstChild("TouchGui")
+        if tg then
+            if not tg.Enabled then tg.Enabled = true end
+            local tcf = tg:FindFirstChild("TouchControlFrame")
+            if tcf and not tcf.Visible then tcf.Visible = true end
+        end
     end)
 end
 -- re-assert across a few frames so it wins regardless of signal ordering with the engine
@@ -815,6 +831,9 @@ do
         Cn.flyConnection = RunService.Heartbeat:Connect(function()
             if not St.flyActive then return end
             if not St.flyRootPart or not St.flyRootPart.Parent then return end
+            -- keep the on-screen joystick + buttons alive the WHOLE time fly is on (fly
+            -- reads the joystick to steer), so they don't vanish the moment you tap FLY.
+            if mobile then forceTouchVisible() end
             
             pcall(function() St.flyHumanoid.PlatformStand = true end)
             pcall(function()
@@ -860,6 +879,7 @@ do
 
     local function disableFly()
         St.flyActive=false; if Cn.flyConnection then Cn.flyConnection:Disconnect() end
+        if mobile then reassertControls() end
         flyStopAllAnims()
         if flyFlySound then pcall(function() flyFlySound:Stop(); flyFlySound:Destroy() end) flyFlySound = nil end
         if flyBoostSndRef then pcall(function() flyBoostSndRef:Stop(); flyBoostSndRef:Destroy() end) flyBoostSndRef = nil end
@@ -1161,6 +1181,24 @@ do
     local function watchChar(c)
         resolveDS()
         pcall(function() c:GetAttributeChangedSignal("Moveset"):Connect(resolveDS) end)
+        -- MOBILE DOWNSLAM: the server only accepts a "Down" finisher while AIRBORNE. On PC
+        -- the combo already pops you off the ground by the finisher; on mobile it doesn't.
+        -- So we watch the combo counter and, right after the 3rd M1, press jump (exactly
+        -- like tapping the jump button) -- then when YOU tap the 4th M1 the finisher fires
+        -- in the air and the hook below turns it into a downslam. No swallow, no spam.
+        pcall(function()
+            c:GetAttributeChangedSignal("CurrentM1"):Connect(function()
+                if not St.autoDownslamEnabled then return end
+                local n = c:GetAttribute("CurrentM1")
+                if n == 3 then
+                    local hum = c:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.FloorMaterial ~= Enum.Material.Air then
+                        pcall(function() hum.Jump = true end)
+                        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                    end
+                end
+            end)
+        end)
     end
     if LocalPlayer.Character then watchChar(LocalPlayer.Character) end
     LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
@@ -1193,7 +1231,7 @@ do
                         pcall(function() hum.Jump = true end)
                         pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
                         local t0 = os.clock()
-                        repeat RunService.Heartbeat:Wait() until hum.FloorMaterial == Enum.Material.Air or (os.clock() - t0) > 0.35
+                        repeat RunService.Heartbeat:Wait() until hum.FloorMaterial == Enum.Material.Air or (os.clock() - t0) > 0.6
                         pcall(function() oldDS(dsRemote, "Down", tgt) end)
                         task.wait(0.05)
                         dsRefiring = false
@@ -2353,10 +2391,16 @@ local function bfFireCharged(effTime, target, skipOrient)
         -- EVERY key release.
         local bfTouchGuard, bfGuardLast = nil, 0
         if mobile then
-            bfTouchGuard = RunService.Heartbeat:Connect(function()
-                if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then
-                    local now = os.clock()
-                    if now - bfGuardLast > 0.08 then bfGuardLast = now; restoreTouchControls() end
+            -- Force the joystick + jump button visible EVERY frame for the whole flash
+            -- (lightweight), plus a heavier control re-assert ~10x/sec. The synthetic move
+            -- key keeps flipping input to "keyboard" (which hides touch controls), so a
+            -- per-frame force is the only way to stop them blinking out during a chain.
+            bfTouchGuard = RunService.RenderStepped:Connect(function()
+                forceTouchVisible()
+                local now = os.clock()
+                if now - bfGuardLast > 0.1 then
+                    bfGuardLast = now
+                    if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then restoreTouchControls() end
                 end
             end)
         end
@@ -2713,7 +2757,7 @@ local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.
 
 local Window = Fluent:CreateWindow({
     Title = "Nigga Hub", SubTitle = "Ultimate Edition", TabWidth = 130,
-    Size = mobile and UDim2.fromOffset(360, 320) or UDim2.fromOffset(600, 480),
+    Size = mobile and UDim2.fromOffset(math.clamp(Camera.ViewportSize.X * 0.92, 300, 540), math.clamp(Camera.ViewportSize.Y * 0.80, 300, 460)) or UDim2.fromOffset(600, 480),
     Acrylic = not mobile, Theme = "Dark", MinimizeKey = Enum.KeyCode.Unknown
 })
 
@@ -3000,14 +3044,32 @@ Tabs.Items:AddButton({
 })
 
 -- [KEYBINDS]
-Tabs.Keybinds:AddKeybind("KbSweep", {Title="Sweep Key", Default="E", Mode="Toggle", ChangedCallback=function(new) Keys.sweepKey = new end})
-Tabs.Keybinds:AddKeybind("KbHunt", {Title="Hunt Key", Default="Y", Mode="Toggle", ChangedCallback=function(new) Keys.huntKey = new end})
-Tabs.Keybinds:AddKeybind("KbBF", {Title="BF Dash Key", Default="G", Mode="Toggle", ChangedCallback=function(new) Keys.bfKey = new end})
-Tabs.Keybinds:AddKeybind("KbFly", {Title="Fly Key", Default="X", Mode="Toggle", ChangedCallback=function(new) Keys.flyKey = new end})
-Tabs.Keybinds:AddKeybind("KbLock", {Title="Lock-On Key", Default="C", Mode="Toggle", ChangedCallback=function(new) Keys.lockOnKey = new end})
-Tabs.Keybinds:AddKeybind("KbYonk", {Title="Yonk Key", Default="J", Mode="Toggle", ChangedCallback=function(new) Keys.yonkKey = new end})
-Tabs.Keybinds:AddKeybind("KbEmote", {Title="Auto Emote Key", Default="Z", Mode="Toggle", ChangedCallback=function(new) Keys.emoteKey = new end})
-Tabs.Keybinds:AddKeybind("KbVoid", {Title="Void Key", Default="V", Mode="Toggle", ChangedCallback=function(new) Keys.voidKey = new end})
+if not mobile then
+    -- PC: real keyboard keybinds.
+    Tabs.Keybinds:AddKeybind("KbSweep", {Title="Sweep Key", Default="E", Mode="Toggle", ChangedCallback=function(new) Keys.sweepKey = new end})
+    Tabs.Keybinds:AddKeybind("KbHunt", {Title="Hunt Key", Default="Y", Mode="Toggle", ChangedCallback=function(new) Keys.huntKey = new end})
+    Tabs.Keybinds:AddKeybind("KbBF", {Title="BF Dash Key", Default="G", Mode="Toggle", ChangedCallback=function(new) Keys.bfKey = new end})
+    Tabs.Keybinds:AddKeybind("KbFly", {Title="Fly Key", Default="X", Mode="Toggle", ChangedCallback=function(new) Keys.flyKey = new end})
+    Tabs.Keybinds:AddKeybind("KbLock", {Title="Lock-On Key", Default="C", Mode="Toggle", ChangedCallback=function(new) Keys.lockOnKey = new end})
+    Tabs.Keybinds:AddKeybind("KbYonk", {Title="Yonk Key", Default="J", Mode="Toggle", ChangedCallback=function(new) Keys.yonkKey = new end})
+    Tabs.Keybinds:AddKeybind("KbEmote", {Title="Auto Emote Key", Default="Z", Mode="Toggle", ChangedCallback=function(new) Keys.emoteKey = new end})
+    Tabs.Keybinds:AddKeybind("KbVoid", {Title="Void Key", Default="V", Mode="Toggle", ChangedCallback=function(new) Keys.voidKey = new end})
+else
+    -- MOBILE: phones can't bind keyboard keys, so instead each box below drops a draggable
+    -- on-screen button for that function (the same float buttons that auto-show when a
+    -- feature is on -- this just lets you summon them for quick access at any time).
+    Tabs.Keybinds:AddSection("Mobile Quick-Access Buttons")
+    local function mbBtn(key, title, btnName)
+        Tabs.Keybinds:AddToggle(key, {Title=title, Default=false, Callback=function(v) _G.NH_btnManual[btnName] = v end})
+    end
+    mbBtn("MbSweep", "Show Sweep Button", "SweepBtn")
+    mbBtn("MbHunt", "Show Hunt Button", "HuntBtn")
+    mbBtn("MbBF", "Show BF Dash Button", "BFBtn")
+    mbBtn("MbFly", "Show Fly Button", "FlyBtn")
+    mbBtn("MbLock", "Show Lock-On Button", "LockBtn")
+    mbBtn("MbYonk", "Show Yonk Button", "YonkBtn")
+    mbBtn("MbEmote", "Show Emote Button", "EmoteBtn")
+end
 
 -- [SETTINGS]
 Tabs.Settings:AddSection("Float Overlays & Visuals")
@@ -3256,7 +3318,7 @@ if mobile then
     RunService.Heartbeat:Connect(function()
         for _, e in ipairs(featureVisible) do
             if e.gui and e.gui.Parent then
-                local want = e.on() and true or false
+                local want = (e.on() or (_G.NH_btnManual and _G.NH_btnManual[e.gui.Name])) and true or false
                 if e.gui.Enabled ~= want then e.gui.Enabled = want end
             end
         end
@@ -3301,6 +3363,7 @@ if mobile then
     dotBtn.Active = true
     
     local dotDrag, dotDragOr, dotFrOr, dotMoved = false, Vector2.zero, Vector2.zero, false
+    local dotPressT = 0
     local dotActiveInput = nil -- the exact finger/mouse dragging the dot (ignore other touches)
     -- MOBILE FIX: keep a cached, DIRECT handle to the hub's ScreenGui so the green
     -- dot can reliably show/hide it. Previously every tap re-searched by title text
@@ -3320,7 +3383,7 @@ if mobile then
                     for _, desc in ipairs(gui:GetDescendants()) do
                         -- partial + TextButton match so it still finds the window even if
                         -- Fluent renders the title slightly differently across versions
-                        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and typeof(desc.Text) == "string" and string.find(desc.Text, "Nigga") then
+                        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and typeof(desc.Text) == "string" and (string.find(desc.Text, "Nigga") or string.find(desc.Text, "Ultimate Edition")) then
                             cachedHubGui = gui; break
                         end
                     end
@@ -3344,26 +3407,45 @@ if mobile then
     -- minimize, so the window can never get stuck in Fluent's collapsed state -- that
     -- collapsed state is exactly why the dot couldn't reopen the hub after you minimized
     -- from the hub's own button.
-    task.delay(1, function()
+    -- Make Fluent's OWN in-UI minimize button do the EXACT same thing as the green dot.
+    -- We do NOT depend on getconnections (not on every executor), and we NEVER let Fluent's
+    -- native minimize run -- that native collapse is what left the window stuck so the dot
+    -- couldn't reopen it. Instead we lay a TRANSPARENT button ON TOP of Fluent's minimize
+    -- button (higher ZIndex), so every tap hits OURS and routes to toggleHub. (Connecting
+    -- BOTH MouseButton1Click and Activated would fire toggleHub twice = a no-op, which was
+    -- the old bug.) getconnections:Disable() is attempted only as a bonus. Retried a few
+    -- times in case Fluent's title bar builds late.
+    local minimizeWired = false
+    local function wireMinimizeButton()
+        if minimizeWired then return end
         local g = findHubGui()
         if not g then return end
         for _, d in ipairs(g:GetDescendants()) do
             if (d:IsA("ImageButton") or d:IsA("TextButton")) and typeof(d.Name) == "string" and string.find(string.lower(d.Name), "minimize") then
-                local disabled = false
                 pcall(function()
                     if getconnections then
-                        for _, c in ipairs(getconnections(d.MouseButton1Click)) do pcall(function() c:Disable() end); disabled = true end
-                        for _, c in ipairs(getconnections(d.Activated)) do pcall(function() c:Disable() end); disabled = true end
+                        for _, c in ipairs(getconnections(d.MouseButton1Click)) do pcall(function() c:Disable() end) end
+                        for _, c in ipairs(getconnections(d.Activated)) do pcall(function() c:Disable() end) end
                     end
                 end)
-                if disabled then
-                    pcall(function() d.MouseButton1Click:Connect(toggleHub) end)
-                    pcall(function() d.Activated:Connect(toggleHub) end)
+                if not d:FindFirstChild("NH_MinOverlay") then
+                    local ov = Instance.new("TextButton")
+                    ov.Name = "NH_MinOverlay"
+                    ov.Size = UDim2.fromScale(1, 1)
+                    ov.BackgroundTransparency = 1
+                    ov.Text = ""
+                    ov.AutoButtonColor = false
+                    ov.ZIndex = (d.ZIndex or 1) + 50
+                    ov.Active = true
+                    ov.Parent = d
+                    ov.Activated:Connect(toggleHub)
                 end
+                minimizeWired = true
                 break
             end
         end
-    end)
+    end
+    for _, t in ipairs({0.5, 1, 2, 3, 5}) do task.delay(t, wireMinimizeButton) end
     -- PC keybind preserved: RightControl toggles the hub through the SAME unified path as
     -- the green dot and the in-UI minimize button, so all three stay in sync and can never
     -- desync. Fluent's own MinimizeKey is set to Unknown above so this is the ONLY handler
@@ -3375,7 +3457,7 @@ if mobile then
     end)
     dotBtn.InputBegan:Connect(function(i) 
         if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then 
-            dotDrag = true; dotMoved = false; dotActiveInput = i; dotDragOr = i.Position; dotFrOr = dotFrame.Position 
+            dotDrag = true; dotMoved = false; dotActiveInput = i; dotDragOr = i.Position; dotFrOr = dotFrame.Position; dotPressT = os.clock() 
         end 
     end)
     UserInputService.InputChanged:Connect(function(i) 
@@ -3395,17 +3477,10 @@ if mobile then
     dotBtn.InputEnded:Connect(function(i) 
         if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then 
             dotDrag = false; dotActiveInput = nil
-            -- TAP (not a drag) => toggle the hub. Movement flag is far more reliable
-            -- on touch than comparing the release position.
-            if not dotMoved then
-                -- Toggle the hub through Fluent's OWN minimize keybind (RightControl).
-                -- This is Fluent's native show/hide path, so it ALWAYS matches Fluent's
-                -- internal minimized state. The old code flipped ScreenGui.Enabled, which
-                -- canNOT restore a window minimized from the hub's own minimize button
-                -- (Fluent keeps the ScreenGui Enabled while minimized) -- THAT is why the
-                -- dot "did nothing" after you minimized from the hub. We know synthetic keys
-                -- register on this executor because the BF move key works; Fluent listens
-                -- for this keybind via UserInputService.InputBegan, so it always toggles.
+            -- TAP (not a drag) => toggle the hub. We treat it as a tap when the finger
+            -- barely moved OR the press was quick. The old "any movement = drag" check made
+            -- tiny-finger-wobble taps do nothing, which is a big reason the dot felt dead.
+            if (not dotMoved) or (os.clock() - dotPressT) < 0.25 then
                 toggleHub()
             end
         end 
