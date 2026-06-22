@@ -1,21 +1,17 @@
 -- ================================================================================
--- CURVED DASH-BEHIND v44 MOBILE+PC
---   All original logic preserved exactly.
---   Mobile additions:
---     • Touch-friendly action buttons (Dash-Behind, Black Flash) — bottom-right,
---       clear of the left-side DynamicThumbstick joystick zone
---     • Panel drag works with both Mouse and Touch
---     • Sliders work with both Mouse and Touch
---     • All KeyCode binds kept for PC; mobile buttons fire the same functions
---     • VIM:SendKeyEvent used for BF keys — works identically on mobile
---     • No fake touch injected anywhere near the joystick
+-- CURVED DASH-BEHIND MOBILE v2 — JOYSTICK FIX
+-- Root cause confirmed via MCP:
+--   VIM:SendKeyEvent fires UIS keyboard events → mobile touch state resets → joystick dies
+--   Fix: tc:UseKey(keyNum, "Activated/Deactivated") = native game mobile skill path
+--   Verified: tc:UseKey fires ZERO UIS keyboard events ✓
 -- ================================================================================
 local Players          = game:GetService("Players")
 local Workspace        = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
-local VIM              = game:GetService("VirtualInputManager")
+local TweenService     = game:GetService("TweenService")
 local Stats            = game:GetService("Stats")
+local Knit             = require(game.ReplicatedStorage.Knit.Knit)
 
 local player = Players.LocalPlayer
 
@@ -23,14 +19,11 @@ local CFG = {
     CURVE_BOW       = 5.0,
     OUT_BOW         = 2.0,
     BACK_DISTANCE   = 4.5,
-    CAM_SENS        = 0.6,
-    CAM_STEER       = true,
     AUTO_BLACKFLASH = true,
     ARRIVE_DIST     = 1.2,
     BF_MAX_WHIFF    = 4.0,
 }
 
-local DASH_KEY          = Enum.KeyCode.E
 local DASH_RANGE        = 10
 local DASH_COOLDOWN     = 0.4
 local DASH_DURATION     = 0.28
@@ -43,12 +36,11 @@ local TRACK_K           = 42
 local YAW_TRACK_K       = 35
 local ACCEL_TRACK_K     = 14
 local EARLY_MIN_FRAC    = 0.35
-local CAM_SETTLE_TIME   = 0.22
 local BEHIND_FINISH_DEG = 62
-local PHYSICS_YAW_BLEND  = 0.75
+local PHYSICS_YAW_BLEND = 0.75
 local FACELOCK_LEAD_BOOST = 1.6
 
-local NO_DASH_GAP  = 4.0
+local NO_DASH_GAP   = 4.0
 local BACK_SIDE_DOT = -0.15
 
 local YAW_ACCEL_TRACK_K  = 12
@@ -64,17 +56,21 @@ local CHAIN_CORRECT_THRESHOLD = 1.6
 local CHAIN_CORRECT_ENABLED   = true
 local CHAIN_DASH_SETTLE       = 0.22
 
+-- BF key number: matches skill slot (1-8)
+-- KeyCode.Three = slot 3. Change to match whichever move you BF with.
 local BF = {
-    MOVE_KEY    = Enum.KeyCode.Three,
-    TRIGGER_KEY = Enum.KeyCode.X,
-    TIMING      = 0.26,
-    HOLD        = 0.02,
+    KEY_NUM  = 3,
+    TIMING   = 0.26,
+    HOLD     = 0.02,
     PING_FACTOR = 0.5,
     PING_MAX    = 0.06,
     INPUT_LAT   = 0.012,
     PING_SMOOTH = 0.40,
     FINE_SPIN   = 0.003,
 }
+
+-- Get ToolController once (same table the game uses for mobile buttons)
+local tc = Knit.GetController("ToolController")
 
 local lastDashTime   = 0
 local isDashing      = false
@@ -93,25 +89,6 @@ local faceLockConf   = 0
 local lastTLookRaw   = nil
 local myLastPos      = nil
 
--- ── mobile detection ─────────────────────────────────────────────────────────
-local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-
--- ── mousemoverel / camera wrapper — works on both PC and mobile via VIM ──────
-local function moveMouse(dx, dy)
-    if type(mousemoverel) == "function" then
-        local ok = pcall(function() mousemoverel(dx, dy) end)
-        if ok then return true end
-    end
-    if VIM and VIM.SendMouseMoveEvent then
-        local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800,600)
-        local ok = pcall(function() VIM:SendMouseMoveEvent(vp.X/2 + dx, vp.Y/2 + dy, game) end)
-        if ok then return true end
-    end
-    return false
-end
-
-local canSteer = (type(mousemoverel) == "function") or (VIM ~= nil and VIM.SendMouseMoveEvent ~= nil)
-
 -- ── ping ─────────────────────────────────────────────────────────────────────
 local function getPing()
     local ok, ping = pcall(function() return player:GetNetworkPing() end)
@@ -119,7 +96,7 @@ local function getPing()
     local ok2, ms = pcall(function()
         return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
     end)
-    if ok2 and type(ms) == "number" and ms > 0 then return (ms / 1000) * 0.5 end
+    if ok2 and type(ms) == "number" and ms > 0 then return (ms/1000)*0.5 end
     return 0
 end
 
@@ -131,17 +108,7 @@ local function getSmoothedPing()
     return smoothedPing
 end
 
--- ── shift lock ───────────────────────────────────────────────────────────────
-local function isShiftLockActive()
-    local mlc = player.PlayerScripts
-        :FindFirstChild("PlayerModule")
-        and player.PlayerScripts.PlayerModule:FindFirstChild("CameraModule")
-        and player.PlayerScripts.PlayerModule.CameraModule:FindFirstChild("MouseLockController")
-    if mlc then return mlc:FindFirstChild("CursorImage") ~= nil end
-    return false
-end
-
--- ── math helpers ──────────────────────────────────────────────────────────────
+-- ── math helpers ─────────────────────────────────────────────────────────────
 local function horizontal(v) return Vector3.new(v.X, 0, v.Z) end
 local function damp(k, dt)   return 1 - math.exp(-k * dt) end
 local function easeOutCirc(x)
@@ -183,14 +150,6 @@ local function getMovementController()
 end
 
 local function nukeGameBV(character)
-    local torso = character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso")
-    if torso then
-        for _, bv in ipairs(torso:GetChildren()) do
-            if bv:IsA("BodyVelocity") then
-                pcall(function() bv.MaxForce = Vector3.zero; bv.Velocity = Vector3.zero; bv:Destroy() end)
-            end
-        end
-    end
     for _, d in ipairs(character:GetDescendants()) do
         if d:IsA("BodyVelocity") then
             pcall(function() d.MaxForce = Vector3.zero; d.Velocity = Vector3.zero; d:Destroy() end)
@@ -222,12 +181,12 @@ local function findTarget()
     return closest, closestDist
 end
 
--- ── LIVE back geometry ────────────────────────────────────────────────────────
+-- ── live back geometry ────────────────────────────────────────────────────────
 local function liveBackInfo(target)
     local char = getCharacter()
     local part = target and (target.PrimaryPart or target:FindFirstChild("HumanoidRootPart"))
     if not char or not part then return math.huge, 1 end
-    local hrp = char.HumanoidRootPart
+    local hrp  = char.HumanoidRootPart
     local look = horizontal(part.CFrame.LookVector)
     if look.Magnitude < 0.01 then look = lastTLook or Vector3.new(0,0,1) end
     look = look.Unit
@@ -271,19 +230,19 @@ local function updateTracker(target)
     if trackedModel == target and lastSampleT and look then
         local dt = now - lastSampleT
         if dt > 1e-4 then
-            local instVel  = (pos - lastTPos) / dt
-            local velDev   = (instVel - estVel).Magnitude
-            local kVel     = adaptiveK(TRACK_K, velDev, ADAPT_VEL_SCALE)
+            local instVel = (pos - lastTPos) / dt
+            local velDev  = (instVel - estVel).Magnitude
+            local kVel    = adaptiveK(TRACK_K, velDev, ADAPT_VEL_SCALE)
             local newEstVel = estVel:Lerp(instVel, damp(kVel, dt))
-            local instAcc  = (newEstVel - estVel) / dt
+            local instAcc = (newEstVel - estVel) / dt
             estAccel = estAccel:Lerp(instAcc, damp(ACCEL_TRACK_K, dt))
-            estVel = newEstVel
+            estVel   = newEstVel
 
             if lastTLookRaw then
                 local instDerivedYaw = signedYawBetween(lastTLookRaw, look) / dt
-                local yawDev   = math.abs(instDerivedYaw - estYawRate)
-                local kYaw     = adaptiveK(YAW_TRACK_K, yawDev, ADAPT_YAW_SCALE)
-                local prevYaw  = estYawRate
+                local yawDev = math.abs(instDerivedYaw - estYawRate)
+                local kYaw   = adaptiveK(YAW_TRACK_K, yawDev, ADAPT_YAW_SCALE)
+                local prevYaw = estYawRate
                 estYawRate = estYawRate + (instDerivedYaw - estYawRate) * damp(kYaw, dt)
                 local instYawAccel = (estYawRate - prevYaw) / dt
                 estYawAccel = estYawAccel + (instYawAccel - estYawAccel) * damp(YAW_ACCEL_TRACK_K, dt)
@@ -302,17 +261,17 @@ local function updateTracker(target)
                     local perpContrib = 0
                     if toMeNow.Magnitude > 0.1 then
                         local radialDir = toMeNow.Unit
-                        local perpDir = Vector3.new(-radialDir.Z, 0, radialDir.X)
+                        local perpDir   = Vector3.new(-radialDir.Z, 0, radialDir.X)
                         perpContrib = myMoveDelta:Dot(perpDir) / math.max(toMeNow.Magnitude, 1)
                     end
                     local theirRotTowardUs = totalBearingDelta - perpContrib
-                    local toMeDir = toMeNow.Unit
-                    local facingDot = look:Dot(toMeDir)
-                    local rotSignal    = math.clamp(theirRotTowardUs / 3.0, 0, 1)
+                    local toMeDir    = toMeNow.Unit
+                    local facingDot  = look:Dot(toMeDir)
+                    local rotSignal  = math.clamp(theirRotTowardUs / 3.0, 0, 1)
                     local facingSignal = math.clamp((facingDot + 1) / 2, 0, 1)
-                    local rawConf = rotSignal * 0.6 + facingSignal * 0.4
-                    local decayK = (facingDot < -0.5) and 8 or 3
-                    local buildK = (theirRotTowardUs > 0.3) and 6 or 1.5
+                    local rawConf    = rotSignal * 0.6 + facingSignal * 0.4
+                    local decayK     = (facingDot < -0.5) and 8 or 3
+                    local buildK     = (theirRotTowardUs > 0.3) and 6 or 1.5
                     local k = (rawConf > faceLockConf) and buildK or decayK
                     faceLockConf = faceLockConf + (rawConf - faceLockConf) * damp(k, dt)
                     faceLockConf = math.clamp(faceLockConf, 0, 1)
@@ -321,19 +280,13 @@ local function updateTracker(target)
         end
     else
         estVel, estAccel = Vector3.zero, Vector3.zero
-        estYawRate   = 0
-        estYawAccel  = 0
-        estPhysYaw   = physYawRaw
-        estBlendedYaw = physYawRaw
+        estYawRate    = 0; estYawAccel   = 0
+        estPhysYaw    = physYawRaw; estBlendedYaw = physYawRaw
         faceLockConf  = 0
     end
 
-    trackedModel = target
-    lastTPos     = pos
-    lastSampleT  = now
-    lastTLookRaw = look
-    lastTLook    = look
-    myLastPos    = myPos
+    trackedModel = target; lastTPos = pos; lastSampleT = now
+    lastTLookRaw = look; lastTLook = look; myLastPos = myPos
 end
 
 local function predictBack(target, lead)
@@ -343,71 +296,68 @@ local function predictBack(target, lead)
     if accLead.Magnitude > 6 then accLead = accLead.Unit * 6 end
     local centerH = horizontal(pos + estVel * lead * POS_PREDICT_BOOST + accLead)
     local baseLook = horizontal(part.CFrame.LookVector)
-    baseLook = (baseLook.Magnitude > 0.01) and baseLook.Unit
-        or (lastTLook or Vector3.new(0, 0, 1))
+    baseLook = (baseLook.Magnitude > 0.01) and baseLook.Unit or (lastTLook or Vector3.new(0,0,1))
 
     local lock = math.clamp(faceLockConf, 0, 1)
-    local effectiveLead = lead * (1 + lock * (FACELOCK_LEAD_BOOST - 1))
-    effectiveLead = math.clamp(effectiveLead, lead, lead * FACELOCK_LEAD_BOOST)
-
-    local snapping = math.abs(estBlendedYaw) > SNAP_YAW_THRESHOLD
-    local snapMul  = snapping and SNAP_LEAD_BOOST or 1
-
+    local effectiveLead = math.clamp(lead * (1 + lock * (FACELOCK_LEAD_BOOST - 1)), lead, lead * FACELOCK_LEAD_BOOST)
+    local snapMul = (math.abs(estBlendedYaw) > SNAP_YAW_THRESHOLD) and SNAP_LEAD_BOOST or 1
     local effYaw = math.clamp(estBlendedYaw, -14, 14)
-    local yawPredict = (effYaw * effectiveLead
-        + 0.5 * math.clamp(estYawAccel, -120, 120) * effectiveLead * effectiveLead) * snapMul
-    yawPredict = math.clamp(yawPredict, -math.pi, math.pi)
-
+    local yawPredict = math.clamp(
+        (effYaw * effectiveLead + 0.5 * math.clamp(estYawAccel,-120,120) * effectiveLead^2) * snapMul,
+        -math.pi, math.pi)
     local predLook = rotateY(baseLook, yawPredict).Unit
     return centerH, centerH - predLook * CFG.BACK_DISTANCE, predLook
 end
 
--- ── camera steering ───────────────────────────────────────────────────────────
-local dxAccumulator = 0
-local function resetCamSteer() dxAccumulator = 0 end
-
-local function steerCameraYaw(focusPos, dt)
-    if not (CFG.CAM_STEER and canSteer) then return nil end
-    local cam = Workspace.CurrentCamera
-    if not cam then return nil end
-    local camPos = cam.CFrame.Position
-    local toT  = horizontal(focusPos - camPos)
-    local look = horizontal(cam.CFrame.LookVector)
-    if toT.Magnitude < 0.1 or look.Magnitude < 0.01 then return nil end
-    toT = toT.Unit; look = look.Unit
-    local crossY = look.X * toT.Z - look.Z * toT.X
-    local dot = look.X * toT.X + look.Z * toT.Z
-    local yawErr = math.atan2(crossY, dot)
-    if math.abs(yawErr) < 0.005 then return 0 end
-    local Kp = 16
-    local turnRads = yawErr * Kp * dt
-    if math.abs(turnRads) > math.abs(yawErr) then turnRads = yawErr end
-    dxAccumulator = dxAccumulator + turnRads * 450 * CFG.CAM_SENS
-    local int_dx = math.modf(dxAccumulator)
-    if int_dx ~= 0 then
-        dxAccumulator = dxAccumulator - int_dx
-        moveMouse(int_dx, 0)
-    end
-    return math.abs(yawErr)
+-- ── BLACK FLASH — uses tc:UseKey instead of VIM ──────────────
+-- tc:UseKey(keyNum, "Activated")   = press  (fires zero UIS keyboard events ✓)
+-- tc:UseKey(keyNum, "Deactivated") = release
+local lastBFComp = 0
+local function bfComputeEff()
+    local ping = getSmoothedPing()
+    local comp = math.clamp(ping * BF.PING_FACTOR, 0, BF.PING_MAX)
+    lastBFComp = comp
+    return math.max(0.05, BF.TIMING + comp - BF.INPUT_LAT)
 end
 
-local function settleCamera(target, shiftLock, prevMouseBehavior)
+local function faceTargetOnce(target)
+    local char = getCharacter()
+    local part = target and (target.PrimaryPart or target:FindFirstChild("HumanoidRootPart"))
+    if not char or not part then return end
+    local hrp = char.HumanoidRootPart
+    local fd = horizontal(part.Position - hrp.Position)
+    if fd.Magnitude > 0.05 then
+        hrp.CFrame = CFrame.lookAt(hrp.Position,
+            Vector3.new(part.Position.X, hrp.Position.Y, part.Position.Z))
+    end
+end
+
+local function bfFireCharged(effTime, target, skipOrient)
+    if bfActive then return end
+    bfActive = true
     task.spawn(function()
-        if CFG.CAM_STEER and canSteer then
-            resetCamSteer()
-            local t0 = tick()
-            while tick() - t0 < CAM_SETTLE_TIME do
-                local dt = RunService.RenderStepped:Wait()
-                local part = target and (target.PrimaryPart or target:FindFirstChild("HumanoidRootPart"))
-                if not part then break end
-                local err = steerCameraYaw(part.Position, dt)
-                if err ~= nil and err < 0.01 then break end
-            end
+        if (not skipOrient) and REACQUIRE_BEFORE_BF and target then
+            faceTargetOnce(target)
         end
-        -- on mobile MouseBehavior lock isn't set so skip the restore safely
-        if not shiftLock and not IS_MOBILE then
-            pcall(function() UserInputService.MouseBehavior = prevMouseBehavior end)
+
+        -- HIT 1: press + release via native game path, NO VIM
+        pcall(function() tc:UseKey(BF.KEY_NUM, "Activated") end)
+        task.wait(BF.HOLD)
+        pcall(function() tc:UseKey(BF.KEY_NUM, "Deactivated") end)
+
+        -- Wait the golden interval
+        local target_t = os.clock() + (effTime - BF.HOLD)
+        while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
+            RunService.Heartbeat:Wait()
         end
+        while bfActive and os.clock() < target_t do end
+
+        -- HIT 2: fires the Black Flash
+        pcall(function() tc:UseKey(BF.KEY_NUM, "Activated") end)
+        task.wait(BF.HOLD)
+        pcall(function() tc:UseKey(BF.KEY_NUM, "Deactivated") end)
+
+        bfActive = false
     end)
 end
 
@@ -423,40 +373,30 @@ local function chainCorrectionDash(target)
 
     local _, backPos = predictBack(target, math.min(CHAIN_DASH_SETTLE, PREDICT_LEAD))
     backPos = horizontal(backPos)
-    local gap = (horizontal(hrp.Position) - backPos).Magnitude
-    if gap <= CHAIN_CORRECT_THRESHOLD then return false end
+    if (horizontal(hrp.Position) - backPos).Magnitude <= CHAIN_CORRECT_THRESHOLD then return false end
 
-    local targetCenter = part.Position
     local humanoid = char:FindFirstChild("Humanoid")
     if humanoid then humanoid.AutoRotate = false end
-    local faceCF = CFrame.lookAt(hrp.Position, Vector3.new(targetCenter.X, hrp.Position.Y, targetCenter.Z))
-    hrp.CFrame   = faceCF
+    local faceCF = CFrame.lookAt(hrp.Position,
+        Vector3.new(part.Position.X, hrp.Position.Y, part.Position.Z))
+    hrp.CFrame = faceCF
 
-    local toBack = (backPos - horizontal(hrp.Position))
+    local toBack = backPos - horizontal(hrp.Position)
     if toBack.Magnitude < 0.01 then
-        if humanoid then humanoid.AutoRotate = true end
-        return false
+        if humanoid then humanoid.AutoRotate = true end; return false
     end
-    local rightVec = horizontal(faceCF.RightVector).Unit
-    local dashDir  = (rightVec:Dot(toBack.Unit) >= 0) and "Right" or "Left"
+    local dashDir = (horizontal(faceCF.RightVector).Unit:Dot(toBack.Unit) >= 0) and "Right" or "Left"
 
-    local ok = pcall(function() controller:Dash(player, char, dashDir) end)
-    if not ok then
-        if humanoid then humanoid.AutoRotate = true end
-        return false
+    if not pcall(function() controller:Dash(player, char, dashDir) end) then
+        if humanoid then humanoid.AutoRotate = true end; return false
     end
 
-    local startTime  = tick()
-    local smVelH     = Vector3.zero
-    local corrConn
+    local startTime = tick(); local smVelH = Vector3.zero; local corrConn
     corrConn = RunService.Stepped:Connect(function(_, dt)
         dt = math.clamp(dt, 1/240, 1/30)
-        local c = getCharacter()
-        if not c then corrConn:Disconnect(); return end
-        local h = c.HumanoidRootPart
-        local elapsed = tick() - startTime
+        local c = getCharacter(); if not c then corrConn:Disconnect(); return end
+        local h = c.HumanoidRootPart; local elapsed = tick() - startTime
         nukeGameBV(c)
-
         local _, tb = predictBack(target, math.clamp(CHAIN_DASH_SETTLE - elapsed, 0.05, PREDICT_LEAD))
         local toBack2 = horizontal(tb) - horizontal(h.Position)
         if toBack2.Magnitude <= 0.8 or elapsed >= CHAIN_DASH_SETTLE then
@@ -466,16 +406,13 @@ local function chainCorrectionDash(target)
                 h.CFrame = CFrame.lookAt(h.Position, Vector3.new(part.Position.X, h.Position.Y, part.Position.Z))
             end
             if humanoid then humanoid.AutoRotate = true end
-            corrConn:Disconnect()
-            return
+            corrConn:Disconnect(); return
         end
-
-        local p    = easeOutCirc(elapsed / CHAIN_DASH_SETTLE)
+        local p = easeOutCirc(elapsed / CHAIN_DASH_SETTLE)
         local velH = (toBack2 / dt) * math.min(1, p + 0.4)
         smVelH = smVelH:Lerp(velH, damp(VEL_SMOOTH_K, dt))
         if smVelH.Magnitude > MAX_SPEED then smVelH = smVelH.Unit * MAX_SPEED end
         h.AssemblyLinearVelocity = Vector3.new(smVelH.X, h.AssemblyLinearVelocity.Y, smVelH.Z)
-
         local goalLook = horizontal(part.Position - h.Position)
         if goalLook.Magnitude > 0.05 then
             local goalRot = CFrame.lookAt(h.Position, h.Position + goalLook.Unit)
@@ -483,55 +420,8 @@ local function chainCorrectionDash(target)
             h.CFrame = CFrame.new(h.Position) * curRot:Lerp(goalRot - goalRot.Position, damp(FACE_K, dt))
         end
     end)
-
     task.wait(CHAIN_DASH_SETTLE + 0.02)
     return true
-end
-
-local function faceTargetOnce(target)
-    local char = getCharacter()
-    local part = target and (target.PrimaryPart or target:FindFirstChild("HumanoidRootPart"))
-    if not char or not part then return end
-    local hrp = char.HumanoidRootPart
-    local fd = horizontal(part.Position - hrp.Position)
-    if fd.Magnitude > 0.05 then
-        hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(part.Position.X, hrp.Position.Y, part.Position.Z))
-    end
-    if CFG.CAM_STEER then steerCameraYaw(part.Position, 1/60) end
-end
-
--- ── Black Flash ───────────────────────────────────────────────────────────────
-local lastBFComp = 0
-local function bfComputeEff()
-    local ping = getSmoothedPing()
-    local comp = math.clamp(ping * BF.PING_FACTOR, 0, BF.PING_MAX)
-    lastBFComp = comp
-    return math.max(0.05, BF.TIMING + comp - BF.INPUT_LAT)
-end
-
--- VIM:SendKeyEvent works on both PC and mobile — no change needed here
-local function bfFireCharged(effTime, target, skipOrient)
-    if bfActive then return end
-    bfActive = true
-    task.spawn(function()
-        if (not skipOrient) and REACQUIRE_BEFORE_BF and target then faceTargetOnce(target) end
-
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-        task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
-
-        local target_t = os.clock() + (effTime - BF.HOLD)
-        while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
-            RunService.Heartbeat:Wait()
-        end
-        while bfActive and os.clock() < target_t do end
-
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-        task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
-
-        bfActive = false
-    end)
 end
 
 local function startBlackFlash(target)
@@ -550,7 +440,7 @@ end
 -- ── main curved dash ──────────────────────────────────────────────────────────
 local function executeCurvedDash(target)
     local controller = getMovementController()
-    if not controller then warn("[CurvedDash] MovementController not found"); return false end
+    if not controller then return false end
     local character  = getCharacter()
     if not character or not target then return false end
     local hrp        = character.HumanoidRootPart
@@ -564,10 +454,8 @@ local function executeCurvedDash(target)
         return true
     end
 
-    local shiftLock = isShiftLockActive()
     local center0, back0 = predictBack(target, math.min(DASH_DURATION, PREDICT_LEAD))
-
-    local radial     = horizontal(hrp.Position - center0)
+    local radial = horizontal(hrp.Position - center0)
     if radial.Magnitude < 0.1 then radial = -horizontal(hrp.CFrame.LookVector) end
     radial = radial.Unit
     local tangentCCW = Vector3.new(-radial.Z, 0, radial.X)
@@ -577,29 +465,19 @@ local function executeCurvedDash(target)
     hrp.CFrame       = faceCF
 
     local startPosH = horizontal(hrp.Position)
-    local centerH   = horizontal(center0)
     local sideBow   = horizontal((dashDir == "Right") and faceCF.RightVector or -faceCF.RightVector)
     if sideBow.Magnitude < 0.01 then sideBow = horizontal(tangentCCW * orbitSign) end
     sideBow = sideBow.Unit
-    local outDir = (startPosH - centerH)
+    local outDir = (startPosH - horizontal(center0))
     outDir = (outDir.Magnitude > 0.1) and outDir.Unit or -horizontal(faceCF.LookVector).Unit
 
-    local ok, err = pcall(function() controller:Dash(player, character, dashDir) end)
-    if not ok then warn("[CurvedDash] Dash() failed:", err); return false end
+    if not pcall(function() controller:Dash(player, character, dashDir) end) then return false end
     isDashing = true
     if humanoid then humanoid.AutoRotate = false end
-    resetCamSteer()
-    local prevMouseBehavior = UserInputService.MouseBehavior
-    -- only lock cursor on PC — on mobile this would fight the touch camera
-    if not IS_MOBILE and CFG.CAM_STEER then
-        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-    end
 
     local dashEffTime = bfComputeEff()
-    local bfArmed     = false
-    local bvKilled    = false
-    local startTime   = tick()
-    local smVelH      = Vector3.zero
+    local bfArmed = false; local bvKilled = false
+    local startTime = tick(); local smVelH = Vector3.zero
     if dashConnection then dashConnection:Disconnect() end
 
     local function finish(hrp2)
@@ -607,38 +485,32 @@ local function executeCurvedDash(target)
         hrp2.AssemblyLinearVelocity = Vector3.new(0, hrp2.AssemblyLinearVelocity.Y, 0)
         local fd = horizontal(targetPart.Position - hrp2.Position)
         if fd.Magnitude > 0.05 then
-            hrp2.CFrame = CFrame.lookAt(hrp2.Position, Vector3.new(targetPart.Position.X, hrp2.Position.Y, targetPart.Position.Z))
+            hrp2.CFrame = CFrame.lookAt(hrp2.Position,
+                Vector3.new(targetPart.Position.X, hrp2.Position.Y, targetPart.Position.Z))
         end
         if humanoid then humanoid.AutoRotate = true end
         isDashing = false
         if dashConnection then dashConnection:Disconnect(); dashConnection = nil end
-
         local _, finalBack = predictBack(target, 0)
         local landGap = horizontal(hrp2.Position - finalBack).Magnitude
-        print(string.format(
-            "[CurvedDash] v44 landed — %.2f studs | behind: %s | lock:%.2f | yawAcc:%.1f | ping +%.0fms",
-            landGap, tostring(isPosBehind(target, hrp2.Position)),
-            faceLockConf, estYawAccel, lastBFComp * 1000))
-
+        print(string.format("[Dash] landed %.2fst | behind:%s | ping+%.0fms",
+            landGap, tostring(isPosBehind(target, hrp2.Position)), lastBFComp*1000))
         if CFG.AUTO_BLACKFLASH and not bfArmed and not bfActive and landGap <= CFG.BF_MAX_WHIFF then
             bfFireCharged(dashEffTime, target, false)
         end
-        settleCamera(target, shiftLock, prevMouseBehavior)
     end
 
     dashConnection = RunService.Stepped:Connect(function(_, dt)
         dt = math.clamp(dt, 1/240, 1/30)
-        local char = getCharacter()
-        if not char or not isDashing then return end
-        local hrp2    = char.HumanoidRootPart
-        local elapsed = tick() - startTime
-        local pos     = hrp2.Position
+        local char = getCharacter(); if not char or not isDashing then return end
+        local hrp2 = char.HumanoidRootPart
+        local elapsed = tick() - startTime; local pos = hrp2.Position
         if not bvKilled then nukeGameBV(char); bvKilled = true end
 
         local remaining = math.max(0, DASH_DURATION - elapsed)
-        local lead      = math.clamp(remaining, 0.05, PREDICT_LEAD)
-        local _, backH  = predictBack(target, lead)
-        local dist      = (horizontal(pos) - backH).Magnitude
+        local lead = math.clamp(remaining, 0.05, PREDICT_LEAD)
+        local _, backH = predictBack(target, lead)
+        local dist = (horizontal(pos) - backH).Magnitude
 
         if CFG.AUTO_BLACKFLASH and not bfArmed and not bfActive and remaining <= dashEffTime then
             bfArmed = true
@@ -648,24 +520,19 @@ local function executeCurvedDash(target)
         if elapsed >= DASH_DURATION * EARLY_MIN_FRAC and dist <= CFG.ARRIVE_DIST and isPosBehind(target, pos) then
             finish(hrp2); return
         end
-        if elapsed >= DASH_MAX_DURATION then
-            finish(hrp2); return
-        end
+        if elapsed >= DASH_MAX_DURATION then finish(hrp2); return end
 
         local desiredPos
         if elapsed < DASH_DURATION then
-            local p       = easeOutCirc(elapsed / DASH_DURATION)
-            local chord   = backH - startPosH
-            local mid     = startPosH + chord * 0.5
-            local taper   = 1 - p
-            local control = mid
-                + sideBow * (chord.Magnitude * 0.55 + CFG.CURVE_BOW)
-                + outDir  * (CFG.OUT_BOW * taper)
-            local omp     = 1 - p
+            local p = easeOutCirc(elapsed / DASH_DURATION)
+            local chord = backH - startPosH
+            local mid = startPosH + chord * 0.5
+            local control = mid + sideBow*(chord.Magnitude*0.55 + CFG.CURVE_BOW) + outDir*(CFG.OUT_BOW*(1-p))
+            local omp = 1 - p
             desiredPos = startPosH*(omp*omp) + control*(2*omp*p) + backH*(p*p)
         else
             local d = backH - horizontal(pos)
-            desiredPos = (d.Magnitude > 0.05) and (horizontal(pos) + d.Unit * (MAX_SPEED * dt)) or backH
+            desiredPos = (d.Magnitude > 0.05) and (horizontal(pos) + d.Unit*(MAX_SPEED*dt)) or backH
         end
 
         local velH = (desiredPos - horizontal(pos)) / dt
@@ -673,315 +540,244 @@ local function executeCurvedDash(target)
         if smVelH.Magnitude > MAX_SPEED then smVelH = smVelH.Unit * MAX_SPEED end
         hrp2.AssemblyLinearVelocity = Vector3.new(smVelH.X, hrp2.AssemblyLinearVelocity.Y, smVelH.Z)
 
-        if CFG.CAM_STEER then steerCameraYaw(targetPart.Position, dt) end
         local goalLook = horizontal(targetPart.Position - pos)
         if goalLook.Magnitude > 0.05 then
             local goalRot = CFrame.lookAt(pos, pos + goalLook.Unit)
             local curRot  = hrp2.CFrame - hrp2.CFrame.Position
-            hrp2.CFrame   = CFrame.new(pos) * curRot:Lerp(goalRot - goalRot.Position, damp(FACE_K, dt))
+            hrp2.CFrame = CFrame.new(pos) * curRot:Lerp(goalRot - goalRot.Position, damp(FACE_K, dt))
         end
     end)
     return true
 end
 
 -- ================================================================================
--- ACTION LOGIC (shared between keyboard and mobile buttons)
+-- MOBILE GUI
 -- ================================================================================
-local function doDash()
+local oldGui = player.PlayerGui:FindFirstChild("DashBehindMobile")
+if oldGui then oldGui:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DashBehindMobile"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 200
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = player.PlayerGui
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(0, 280, 0, 28)
+statusLabel.Position = UDim2.new(0.5, -140, 0, 60)
+statusLabel.BackgroundColor3 = Color3.fromRGB(10,10,20)
+statusLabel.BackgroundTransparency = 0.3
+statusLabel.TextColor3 = Color3.fromRGB(200,200,200)
+statusLabel.Font = Enum.Font.GothamBold; statusLabel.TextSize = 13
+statusLabel.Text = "Ready"; statusLabel.BorderSizePixel = 0
+statusLabel.Parent = screenGui
+Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0,8)
+
+-- Settings panel
+local panel = Instance.new("Frame")
+panel.Size = UDim2.new(0,260,0,390); panel.Position = UDim2.new(0,10,0,100)
+panel.BackgroundColor3 = Color3.fromRGB(18,18,26); panel.BackgroundTransparency = 0.08
+panel.BorderSizePixel = 0; panel.Active = true; panel.Parent = screenGui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0,14)
+local pStroke = Instance.new("UIStroke", panel)
+pStroke.Color = Color3.fromRGB(0,170,255); pStroke.Thickness = 1.5; pStroke.Transparency = 0.4
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1,0,0,38); titleBar.BackgroundColor3 = Color3.fromRGB(0,130,210)
+titleBar.BackgroundTransparency = 0.15; titleBar.BorderSizePixel = 0
+titleBar.Active = true; titleBar.Parent = panel
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0,14)
+
+local titleTxt = Instance.new("TextLabel", titleBar)
+titleTxt.Size = UDim2.new(1,-70,1,0); titleTxt.Position = UDim2.new(0,12,0,0)
+titleTxt.BackgroundTransparency = 1; titleTxt.TextXAlignment = Enum.TextXAlignment.Left
+titleTxt.Text = "⚔ Dash Behind v2 Mobile"; titleTxt.TextColor3 = Color3.fromRGB(255,255,255)
+titleTxt.Font = Enum.Font.GothamBold; titleTxt.TextSize = 13
+
+local collapseBtn = Instance.new("TextButton", titleBar)
+collapseBtn.Size = UDim2.new(0,56,0,26); collapseBtn.Position = UDim2.new(1,-62,0.5,-13)
+collapseBtn.BackgroundColor3 = Color3.fromRGB(255,255,255); collapseBtn.BackgroundTransparency = 0.82
+collapseBtn.Text = "Hide"; collapseBtn.TextColor3 = Color3.fromRGB(255,255,255)
+collapseBtn.Font = Enum.Font.GothamBold; collapseBtn.TextSize = 12; collapseBtn.BorderSizePixel = 0
+Instance.new("UICorner", collapseBtn).CornerRadius = UDim.new(0,7)
+
+local panelContent = Instance.new("Frame", panel)
+panelContent.Size = UDim2.new(1,0,1,-38); panelContent.Position = UDim2.new(0,0,0,38)
+panelContent.BackgroundTransparency = 1
+
+local collapsed = false
+collapseBtn.MouseButton1Click:Connect(function()
+    collapsed = not collapsed; panelContent.Visible = not collapsed
+    panel.Size = collapsed and UDim2.new(0,260,0,38) or UDim2.new(0,260,0,390)
+    collapseBtn.Text = collapsed and "Show" or "Hide"
+end)
+
+-- Drag
+do
+    local dragging, dragStart, startPos = false, nil, nil
+    titleBar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging=true; dragStart=i.Position; startPos=panel.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X,
+                startPos.Y.Scale, startPos.Y.Offset+d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then dragging=false end
+    end)
+end
+
+local function makeSlider(parent, yPos, name, minV, maxV, default, decimals, onChange)
+    local holder = Instance.new("Frame", parent)
+    holder.Size = UDim2.new(1,-24,0,46); holder.Position = UDim2.new(0,12,0,yPos)
+    holder.BackgroundTransparency = 1
+    local label = Instance.new("TextLabel", holder)
+    label.Size = UDim2.new(1,0,0,18); label.BackgroundTransparency = 1
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.Gotham; label.TextSize = 13
+    label.TextColor3 = Color3.fromRGB(220,220,220)
+    local function fmt(v) return string.format("%."..decimals.."f", v) end
+    local bar = Instance.new("Frame", holder)
+    bar.Size = UDim2.new(1,0,0,8); bar.Position = UDim2.new(0,0,0,28)
+    bar.BackgroundColor3 = Color3.fromRGB(60,60,70); bar.BorderSizePixel = 0; bar.Active = true
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1,0)
+    local fill = Instance.new("Frame", bar)
+    fill.BackgroundColor3 = Color3.fromRGB(0,185,255); fill.BorderSizePixel = 0
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1,0)
+    local knob = Instance.new("Frame", bar)
+    knob.Size = UDim2.new(0,20,0,20); knob.AnchorPoint = Vector2.new(0.5,0.5)
+    knob.BackgroundColor3 = Color3.fromRGB(255,255,255); knob.BorderSizePixel = 0; knob.Active = true
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1,0)
+    local function apply(a)
+        a = math.clamp(a,0,1)
+        fill.Size = UDim2.new(a,0,1,0); knob.Position = UDim2.new(a,0,0.5,0)
+        label.Text = name..":  "..fmt(minV+(maxV-minV)*a)
+        if onChange then onChange(minV+(maxV-minV)*a) end
+    end
+    apply((default-minV)/(maxV-minV))
+    local dragging = false
+    local function setX(px) apply((px-bar.AbsolutePosition.X)/math.max(1,bar.AbsoluteSize.X)) end
+    local function dn(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            dragging=true; setX(i.Position.X) end end
+    bar.InputBegan:Connect(dn); knob.InputBegan:Connect(dn)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then setX(i.Position.X) end end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end end)
+end
+
+local function makeToggle(parent, yPos, labelOn, labelOff, default, color, onChange)
+    local btn = Instance.new("TextButton", parent)
+    btn.Size = UDim2.new(1,-24,0,36); btn.Position = UDim2.new(0,12,0,yPos)
+    btn.BorderSizePixel = 0; btn.Font = Enum.Font.GothamBold; btn.TextSize = 13
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0,10)
+    local state = default
+    local function refresh()
+        btn.Text = state and labelOn or labelOff
+        btn.BackgroundColor3 = state and color or Color3.fromRGB(100,50,50)
+    end
+    refresh()
+    btn.MouseButton1Click:Connect(function() state=not state; refresh(); if onChange then onChange(state) end end)
+end
+
+-- BF key slot selector (shows current slot number)
+local bfSlotRow = Instance.new("Frame", panelContent)
+bfSlotRow.Size = UDim2.new(1,-24,0,36); bfSlotRow.Position = UDim2.new(0,12,0,6)
+bfSlotRow.BackgroundTransparency = 1
+local bfSlotLabel = Instance.new("TextLabel", bfSlotRow)
+bfSlotLabel.Size = UDim2.new(0.6,0,1,0); bfSlotLabel.BackgroundTransparency = 1
+bfSlotLabel.TextXAlignment = Enum.TextXAlignment.Left
+bfSlotLabel.TextColor3 = Color3.fromRGB(220,220,220)
+bfSlotLabel.Font = Enum.Font.GothamBold; bfSlotLabel.TextSize = 13
+bfSlotLabel.Text = "BF Skill Slot:  " .. BF.KEY_NUM
+local function makeMiniBtn(parent, x, txt, clr, cb)
+    local b = Instance.new("TextButton", parent)
+    b.Size = UDim2.new(0,32,0,28); b.Position = UDim2.new(0,x,0.5,-14)
+    b.BackgroundColor3 = clr; b.BorderSizePixel = 0
+    b.Text = txt; b.TextColor3 = Color3.fromRGB(255,255,255)
+    b.Font = Enum.Font.GothamBold; b.TextSize = 14
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
+    b.MouseButton1Click:Connect(cb); return b
+end
+makeMiniBtn(bfSlotRow, 138, "−", Color3.fromRGB(160,60,60), function()
+    BF.KEY_NUM = math.max(1, BF.KEY_NUM - 1)
+    bfSlotLabel.Text = "BF Skill Slot:  " .. BF.KEY_NUM
+end)
+makeMiniBtn(bfSlotRow, 174, "+", Color3.fromRGB(60,140,60), function()
+    BF.KEY_NUM = math.min(8, BF.KEY_NUM + 1)
+    bfSlotLabel.Text = "BF Skill Slot:  " .. BF.KEY_NUM
+end)
+
+makeSlider(panelContent, 50,  "Curve Width",   0,   12,  CFG.CURVE_BOW,    1, function(v) CFG.CURVE_BOW    = v end)
+makeSlider(panelContent, 96,  "Back Gap",      1,   8,   CFG.BACK_DISTANCE, 1, function(v) CFG.BACK_DISTANCE= v end)
+makeSlider(panelContent, 142, "Predict Lead",  0.10,0.60,PREDICT_LEAD,     2, function(v) PREDICT_LEAD      = v end)
+makeSlider(panelContent, 188, "No-Dash Range", 1.0, 8.0, NO_DASH_GAP,      1, function(v) NO_DASH_GAP       = v end)
+makeSlider(panelContent, 234, "BF Timing",     0.15,0.40,BF.TIMING,        3, function(v) BF.TIMING         = v end)
+makeSlider(panelContent, 280, "Dash Speed",    120, 600, MAX_SPEED,         0, function(v) MAX_SPEED         = v end)
+
+makeToggle(panelContent, 330, "Auto Black Flash: ON","Auto Black Flash: OFF",
+    true, Color3.fromRGB(150,40,160), function(v) CFG.AUTO_BLACKFLASH = v end)
+makeToggle(panelContent, 370, "Chain Reposition: ON","Chain Reposition: OFF",
+    true, Color3.fromRGB(170,110,0), function(v) CHAIN_CORRECT_ENABLED = v end)
+
+-- Main action buttons
+local dashBtn = Instance.new("TextButton")
+dashBtn.Size = UDim2.new(0,110,0,110); dashBtn.Position = UDim2.new(1,-130,1,-200)
+dashBtn.BackgroundColor3 = Color3.fromRGB(0,160,255); dashBtn.BackgroundTransparency = 0.15
+dashBtn.BorderSizePixel = 0; dashBtn.Text = "DASH"
+dashBtn.TextColor3 = Color3.fromRGB(255,255,255); dashBtn.Font = Enum.Font.GothamBold
+dashBtn.TextSize = 22; dashBtn.Parent = screenGui
+Instance.new("UICorner", dashBtn).CornerRadius = UDim.new(1,0)
+local dStroke = Instance.new("UIStroke", dashBtn)
+dStroke.Color = Color3.fromRGB(255,255,255); dStroke.Thickness = 2; dStroke.Transparency = 0.6
+
+local flashBtn = Instance.new("TextButton")
+flashBtn.Size = UDim2.new(0,110,0,110); flashBtn.Position = UDim2.new(0,20,1,-200)
+flashBtn.BackgroundColor3 = Color3.fromRGB(160,30,200); flashBtn.BackgroundTransparency = 0.15
+flashBtn.BorderSizePixel = 0; flashBtn.Text = "FLASH"
+flashBtn.TextColor3 = Color3.fromRGB(255,255,255); flashBtn.Font = Enum.Font.GothamBold
+flashBtn.TextSize = 22; flashBtn.Parent = screenGui
+Instance.new("UICorner", flashBtn).CornerRadius = UDim.new(1,0)
+local fStroke = Instance.new("UIStroke", flashBtn)
+fStroke.Color = Color3.fromRGB(255,255,255); fStroke.Thickness = 2; fStroke.Transparency = 0.6
+
+local function flashBtnPulse(btn, col)
+    local orig = btn.BackgroundColor3
+    btn.BackgroundColor3 = col
+    TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = orig}):Play()
+end
+
+dashBtn.MouseButton1Click:Connect(function()
     if isDashing or bfActive then return end
     local target, dist = findTarget()
-    if not target then info_label_ref and (info_label_ref.Text = "No target within "..DASH_RANGE.." studs") return end
+    if not target then statusLabel.Text = "No target within "..DASH_RANGE.." studs"; return end
     if alreadyAtBack(target) then
-        info_label_ref and (info_label_ref.Text = string.format("On back of %s — Black Flash", target.Name))
-        startBlackFlash(target)
-        return
+        statusLabel.Text = "On back — Flash!"
+        flashBtnPulse(dashBtn, Color3.fromRGB(180,60,220))
+        startBlackFlash(target); return
     end
     local now = tick()
     if now - lastDashTime < DASH_COOLDOWN then return end
     lastDashTime = now
-    info_label_ref and (info_label_ref.Text = string.format("Dash → behind %s (%.1f)", target.Name, dist))
+    statusLabel.Text = string.format("Dash → %s (%.1f)", target.Name, dist)
+    flashBtnPulse(dashBtn, Color3.fromRGB(255,255,100))
     executeCurvedDash(target)
-end
-
-local function doBF()
-    local target = findTarget()
-    startBlackFlash(target)
-end
-
--- ================================================================================
--- UI — shared between PC and mobile
--- Joystick safety: the DynamicThumbstick lives bottom-LEFT.
--- All our mobile action buttons sit bottom-RIGHT (mirroring the game's layout).
--- The settings panel sits top-LEFT with Touch drag support.
--- ================================================================================
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "CurvedDashUI"
-screenGui.ResetOnSpawn = false
-screenGui.DisplayOrder = 100
-screenGui.IgnoreGuiInset = true
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling  -- never fights joystick ZIndex
-screenGui.Parent = player.PlayerGui
-
--- Status text (shown above the mobile buttons on mobile, or above E button on PC)
-local info = Instance.new("TextLabel", screenGui)
-info.Size = UDim2.new(0, 340, 0, 20)
-info.Position = UDim2.new(0.5, -170, 0.92, 40)
-info.BackgroundTransparency = 1
-info.Text = "Ready"
-info.TextColor3 = Color3.fromRGB(180, 180, 180)
-info.Font = Enum.Font.Gotham
-info.TextSize = 13
-info.ZIndex = 5
--- store ref for doDash/doBF to update
-local info_label = info
-
--- ── PC E-key indicator button (hidden on mobile) ──────────────────────────────
-local dashBtn = Instance.new("Frame")
-dashBtn.Size = UDim2.new(0, 70, 0, 70)
-dashBtn.Position = UDim2.new(0.5, -35, 0.9, -35)
-dashBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-dashBtn.BackgroundTransparency = 0.2
-dashBtn.BorderSizePixel = 0
-dashBtn.Visible = not IS_MOBILE
-dashBtn.Parent = screenGui
-Instance.new("UICorner", dashBtn).CornerRadius = UDim.new(0, 14)
-local stroke = Instance.new("UIStroke", dashBtn)
-stroke.Color = Color3.fromRGB(0, 200, 255); stroke.Thickness = 2; stroke.Transparency = 0.5
-local labelTxt = Instance.new("TextLabel", dashBtn)
-labelTxt.Size = UDim2.new(1, 0, 1, 0); labelTxt.BackgroundTransparency = 1
-labelTxt.Text = "E"; labelTxt.TextColor3 = Color3.fromRGB(255, 255, 255)
-labelTxt.Font = Enum.Font.GothamBold; labelTxt.TextSize = 32
-
--- ── MOBILE ACTION BUTTONS ─────────────────────────────────────────────────────
--- Position: bottom-right corner, above the game's existing Jump/Dash buttons.
--- Two large tap targets: [DASH] and [BF]
--- These are ImageButton so they correctly absorb touch without propagating to world.
-if IS_MOBILE then
-    -- Container sits at the bottom-right, 110px from right edge, 160px from bottom
-    local mobileBar = Instance.new("Frame", screenGui)
-    mobileBar.Size = UDim2.new(0, 160, 0, 75)
-    mobileBar.Position = UDim2.new(1, -175, 1, -160)
-    mobileBar.BackgroundTransparency = 1
-    mobileBar.ZIndex = 10
-
-    local function makeMobileBtn(parent, xOff, label, color, callback)
-        local btn = Instance.new("ImageButton", parent)
-        btn.Size = UDim2.new(0, 72, 0, 72)
-        btn.Position = UDim2.new(0, xOff, 0, 0)
-        btn.BackgroundColor3 = color
-        btn.BackgroundTransparency = 0.15
-        btn.BorderSizePixel = 0
-        btn.ZIndex = 11
-        btn.AutoButtonColor = false  -- prevent default highlight fighting touch
-        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 16)
-        local stroke2 = Instance.new("UIStroke", btn)
-        stroke2.Color = Color3.fromRGB(255, 255, 255); stroke2.Thickness = 1.5; stroke2.Transparency = 0.6
-        local lbl = Instance.new("TextLabel", btn)
-        lbl.Size = UDim2.new(1, 0, 1, 0); lbl.BackgroundTransparency = 1
-        lbl.Text = label; lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
-        lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 14; lbl.ZIndex = 12
-        -- Use Activated for reliable single-tap on mobile (no hold/drag confusion)
-        btn.Activated:Connect(callback)
-        return btn
-    end
-
-    makeMobileBtn(mobileBar, 0,  "DASH\n⚔", Color3.fromRGB(0, 140, 200), doDash)
-    makeMobileBtn(mobileBar, 88, " BF\n⚡",  Color3.fromRGB(140, 40, 160), doBF)
-end
-
--- ── SETTINGS PANEL ────────────────────────────────────────────────────────────
-local panel = Instance.new("Frame")
-panel.Size = UDim2.new(0, 240, 0, 410)
-panel.Position = UDim2.new(0, 20, 0, 90)
-panel.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-panel.BackgroundTransparency = 0.05
-panel.BorderSizePixel = 0
-panel.Active = true
-panel.Parent = screenGui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
-local pStroke = Instance.new("UIStroke", panel)
-pStroke.Color = Color3.fromRGB(0, 180, 255); pStroke.Thickness = 1.5; pStroke.Transparency = 0.4
-
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 30)
-titleBar.BackgroundColor3 = Color3.fromRGB(0, 140, 200)
-titleBar.BackgroundTransparency = 0.15
-titleBar.BorderSizePixel = 0
-titleBar.Active = true
-titleBar.Parent = panel
-Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
-
-local titleTxt = Instance.new("TextLabel", titleBar)
-titleTxt.Size = UDim2.new(1, -60, 1, 0); titleTxt.Position = UDim2.new(0, 12, 0, 0)
-titleTxt.BackgroundTransparency = 1; titleTxt.TextXAlignment = Enum.TextXAlignment.Left
-titleTxt.Text = "⚔ Dash v44 + Predict"; titleTxt.TextColor3 = Color3.fromRGB(255, 255, 255)
-titleTxt.Font = Enum.Font.GothamBold; titleTxt.TextSize = 14
-
-local content = Instance.new("Frame")
-content.Size = UDim2.new(1, 0, 1, -30); content.Position = UDim2.new(0, 0, 0, 30)
-content.BackgroundTransparency = 1; content.Parent = panel
-
-local collapseBtn = Instance.new("TextButton", titleBar)
-collapseBtn.Size = UDim2.new(0, 46, 0, 20); collapseBtn.Position = UDim2.new(1, -52, 0.5, -10)
-collapseBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255); collapseBtn.BackgroundTransparency = 0.8
-collapseBtn.Text = "Hide"; collapseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-collapseBtn.Font = Enum.Font.Gotham; collapseBtn.TextSize = 12; collapseBtn.BorderSizePixel = 0
-Instance.new("UICorner", collapseBtn).CornerRadius = UDim.new(0, 6)
-
-local collapsed = false
-collapseBtn.MouseButton1Click:Connect(function()
-    collapsed = not collapsed; content.Visible = not collapsed
-    panel.Size = collapsed and UDim2.new(0, 240, 0, 30) or UDim2.new(0, 240, 0, 410)
-    collapseBtn.Text = collapsed and "Show" or "Hide"
-end)
--- mobile collapse via Activated (works for both tap and click)
-collapseBtn.Activated:Connect(function()
-    if not IS_MOBILE then return end  -- PC handled by MouseButton1Click above
-    collapsed = not collapsed; content.Visible = not collapsed
-    panel.Size = collapsed and UDim2.new(0, 240, 0, 30) or UDim2.new(0, 240, 0, 410)
-    collapseBtn.Text = collapsed and "Show" or "Hide"
 end)
 
--- ── Panel drag — Mouse AND Touch ──────────────────────────────────────────────
-do
-    local dragging, dragStart, startPos = false, nil, nil
-    local function beginDrag(pos)
-        dragging = true; dragStart = pos; startPos = panel.Position
-    end
-    local function moveDrag(pos)
-        if not dragging then return end
-        local d = pos - dragStart
-        panel.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end
-    local function endDrag() dragging = false end
-
-    titleBar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-            beginDrag(i.Position)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseMovement
-        or i.UserInputType == Enum.UserInputType.Touch then
-            moveDrag(i.Position)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-            endDrag()
-        end
-    end)
-end
-
--- ── Sliders — Mouse AND Touch ─────────────────────────────────────────────────
-local function makeSlider(yPos, name, minV, maxV, default, decimals, onChange)
-    local holder = Instance.new("Frame", content)
-    holder.Size = UDim2.new(1, -24, 0, 42); holder.Position = UDim2.new(0, 12, 0, yPos)
-    holder.BackgroundTransparency = 1
-    local label = Instance.new("TextLabel", holder)
-    label.Size = UDim2.new(1, 0, 0, 16); label.BackgroundTransparency = 1
-    label.TextXAlignment = Enum.TextXAlignment.Left; label.Font = Enum.Font.Gotham
-    label.TextSize = 13; label.TextColor3 = Color3.fromRGB(225, 225, 225)
-    local function fmt(v) return string.format("%." .. decimals .. "f", v) end
-    local bar = Instance.new("Frame", holder)
-    bar.Size = UDim2.new(1, 0, 0, 6); bar.Position = UDim2.new(0, 0, 0, 26)
-    bar.BackgroundColor3 = Color3.fromRGB(70, 70, 75); bar.BorderSizePixel = 0; bar.Active = true
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
-    local fill = Instance.new("Frame", bar)
-    fill.BackgroundColor3 = Color3.fromRGB(0, 185, 255); fill.BorderSizePixel = 0
-    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
-    local knob = Instance.new("Frame", bar)
-    knob.Size = UDim2.new(0, 14, 0, 14); knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255); knob.BorderSizePixel = 0; knob.Active = true
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
-    local function apply(a)
-        a = math.clamp(a, 0, 1)
-        local value = minV + (maxV - minV) * a
-        fill.Size = UDim2.new(a, 0, 1, 0); knob.Position = UDim2.new(a, 0, 0.5, 0)
-        label.Text = name .. ":  " .. fmt(value)
-        if onChange then onChange(value) end
-    end
-    apply((default - minV) / (maxV - minV))
-    local dragging = false
-    local function setFromX(px)
-        apply((px - bar.AbsolutePosition.X) / math.max(1, bar.AbsoluteSize.X))
-    end
-    local function dn(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true; setFromX(i.Position.X)
-        end
-    end
-    bar.InputBegan:Connect(dn); knob.InputBegan:Connect(dn)
-    UserInputService.InputChanged:Connect(function(i)
-        if dragging and (
-            i.UserInputType == Enum.UserInputType.MouseMovement
-            or i.UserInputType == Enum.UserInputType.Touch
-        ) then
-            setFromX(i.Position.X)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-end
-
-makeSlider(6,   "Curve Width",    0,    12,   CFG.CURVE_BOW,     1, function(v) CFG.CURVE_BOW       = v end)
-makeSlider(48,  "Back Gap",       1,    8,    CFG.BACK_DISTANCE, 1, function(v) CFG.BACK_DISTANCE   = v end)
-makeSlider(90,  "Predict Lead",   0.10, 0.60, PREDICT_LEAD,      2, function(v) PREDICT_LEAD        = v end)
-makeSlider(132, "Snap Lead",      1.0,  3.5,  SNAP_LEAD_BOOST,   2, function(v) SNAP_LEAD_BOOST     = v end)
-makeSlider(174, "No-Dash Range",  1.0,  8.0,  NO_DASH_GAP,       1, function(v) NO_DASH_GAP         = v end)
-makeSlider(216, "Camera Speed",   0.1,  1.5,  CFG.CAM_SENS,      2, function(v) CFG.CAM_SENS        = v end)
-makeSlider(258, "BF Timing",      0.15, 0.40, BF.TIMING,         3, function(v) BF.TIMING           = v end)
-makeSlider(300, "Dash Speed Cap", 120,  600,  MAX_SPEED,         0, function(v) MAX_SPEED           = v end)
-
-local function makeToggleBtn(yPos, labelOn, labelOff, initOn, color, onToggle)
-    local btn = Instance.new("TextButton", content)
-    btn.Size = UDim2.new(1, -24, 0, 24); btn.Position = UDim2.new(0, 12, 0, yPos)
-    btn.BackgroundColor3 = initOn and color or Color3.fromRGB(120, 60, 60)
-    btn.BorderSizePixel = 0; btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12; btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Text = initOn and labelOn or labelOff
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
-    local state = initOn
-    local function toggle()
-        state = not state
-        btn.Text = state and labelOn or labelOff
-        btn.BackgroundColor3 = state and color or Color3.fromRGB(120, 60, 60)
-        onToggle(state)
-    end
-    btn.MouseButton1Click:Connect(toggle)
-    btn.Activated:Connect(function() if IS_MOBILE then toggle() end end)
-    return btn
-end
-
-makeToggleBtn(346, "Camera Follow: ON",    "Camera Follow: OFF",    canSteer,
-    canSteer and Color3.fromRGB(0, 160, 90) or Color3.fromRGB(90, 90, 90),
-    function(v) if canSteer then CFG.CAM_STEER = v end end)
-
-makeToggleBtn(374, "Auto Black Flash: ON", "Auto Black Flash: OFF", true,
-    Color3.fromRGB(150, 40, 160),
-    function(v) CFG.AUTO_BLACKFLASH = v end)
-
-makeToggleBtn(402, "Chain Reposition: ON", "Chain Reposition: OFF", true,
-    Color3.fromRGB(180, 120, 0),
-    function(v) CHAIN_CORRECT_ENABLED = v end)
-
--- ================================================================================
--- INPUT — keyboard (PC) + Heartbeat tracker (both)
--- Mobile action buttons already wired above via Activated.
--- ================================================================================
-UserInputService.InputBegan:Connect(function(input, gp)
-    if gp then return end
-    if input.KeyCode == BF.TRIGGER_KEY then doBF(); return end
-    if input.KeyCode == DASH_KEY then doDash() end
+flashBtn.MouseButton1Click:Connect(function()
+    flashBtnPulse(flashBtn, Color3.fromRGB(220,100,255))
+    startBlackFlash(findTarget())
 end)
 
 RunService.Heartbeat:Connect(function()
@@ -990,17 +786,24 @@ RunService.Heartbeat:Connect(function()
     if not isDashing then
         if target then
             local behind = alreadyAtBack(target)
-            dashBtn.BackgroundColor3 = behind
-                and Color3.fromRGB(150, 40, 160)
-                or  Color3.fromRGB(0, 180, 255)
-            info.Text = string.format("%s %s (%.1f) | lock:%.2f yaw:%.1f acc:%.0f",
-                behind and "FLASH" or "DASH",
-                target.Name, dist, faceLockConf, estBlendedYaw, estYawAccel)
+            dashBtn.BackgroundColor3 = behind and Color3.fromRGB(160,40,200) or Color3.fromRGB(0,160,255)
+            dashBtn.Text = behind and "FLASH" or "DASH"
+            if not bfActive then
+                statusLabel.Text = string.format("%s %s (%.1f) | lock:%.2f",
+                    behind and "FLASH" or "DASH", target.Name, dist, faceLockConf)
+            end
         else
-            dashBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-            info.Text = "No target within " .. DASH_RANGE .. " studs"
+            dashBtn.BackgroundColor3 = Color3.fromRGB(50,50,60)
+            dashBtn.Text = "DASH"
+            statusLabel.Text = "No target within "..DASH_RANGE.." studs"
         end
+    end
+    if bfActive then
+        flashBtn.BackgroundColor3 = Color3.fromRGB(220,80,255)
+        statusLabel.Text = "⚡ Black Flash..."
+    else
+        flashBtn.BackgroundColor3 = Color3.fromRGB(160,30,200)
     end
 end)
 
-print("CURVED DASH-BEHIND v44 MOBILE+PC — loaded")
+print("DASH BEHIND MOBILE v2 — joystick fix — loaded")
