@@ -1184,17 +1184,17 @@ end
 do
     local dsRemote = nil
     local function dsLiftOff(c, hum)
-        -- GENTLE hop -- just enough to lift the feet off the ground so the server will
-        -- accept a "Down" finisher. Previously this injected a big upward velocity (50)
-        -- AND forced a Jumping state, which launched the character way up and looked
-        -- choppy. We now do a natural jump and cap the upward velocity LOW for a slight,
-        -- smooth lift. No forced state change.
+        -- SLIGHT, reliable hop. A plain hum.Jump is suppressed by the combo's Movement state
+        -- mid-combo on mobile, so we ALSO force the Jumping STATE (server treats us as airborne
+        -- and will accept the "Down" finisher) and inject a SMALL upward velocity. v35 used 50
+        -- here which launched you way too high/choppy; 28 just lifts the feet off the ground.
         pcall(function() hum.Jump = true end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
         local hrp = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart"))
         if hrp then
             pcall(function()
                 local v = hrp.AssemblyLinearVelocity
-                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 22, v.Z)
+                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 28, v.Z)
             end)
         end
     end
@@ -1217,10 +1217,24 @@ do
     local function watchChar(c)
         resolveDS()
         pcall(function() c:GetAttributeChangedSignal("Moveset"):Connect(resolveDS) end)
-        -- NO pre-jump on the 3rd M1 anymore. That hop fired too EARLY (a full M1 before
-        -- the finisher) and too high, which is what made the downslam look choppy and
-        -- launch you up. The finisher hook below now does a single SMALL hop at the exact
-        -- moment the 4th-M1 finisher fires, so the lift lands right on the downslam.
+        -- RESTORED (with a gentle hop): the server only accepts a "Down" finisher while AIRBORNE,
+        -- and on mobile the combo does NOT pop you off the ground. So we watch the combo counter
+        -- and do a SLIGHT hop right after the 3rd M1 -- then when YOU tap the 4th M1 the finisher
+        -- fires in the air and the hook below turns it into a downslam. This is the v35 approach
+        -- that actually WORKED; removing it (v36) broke downslam because the in-air swallow/re-fire
+        -- can't reliably leave the ground. dsLiftOff is now a small hop so it isn't too high.
+        pcall(function()
+            c:GetAttributeChangedSignal("CurrentM1"):Connect(function()
+                if not St.autoDownslamEnabled then return end
+                local n = c:GetAttribute("CurrentM1")
+                if n == 3 then
+                    local hum = c:FindFirstChildOfClass("Humanoid")
+                    if hum and not dsAirborne(hum) then
+                        dsLiftOff(c, hum)
+                    end
+                end
+            end)
+        end)
     end
     if LocalPlayer.Character then watchChar(LocalPlayer.Character) end
     LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
@@ -1507,7 +1521,7 @@ do
         task.delay(0.12, function() attackerDebounce[attacker] = nil end)
 
         faceTarget(theirHRP)
-        if St.autoBlockEnabled then
+        if St.autoBlockEnabled or St.autoPunishEnabled then
             getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
             forceStartBlock()
         end
@@ -1518,7 +1532,7 @@ do
     local projDebounce = {}
 
     local function onProjectileFire(attacker, projCFrame)
-        if not St.autoBlockEnabled then return end
+        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
         if typeof(attacker) ~= "Instance" or not attacker:IsA("Model") then return end
         if attacker == player.Character then return end
         local myChar = player.Character
@@ -1565,7 +1579,7 @@ do
                                 local vel = arg2.Velocity
                                 if vel.Magnitude < 1 then return end
                                 if vel.Unit:Dot(toMe.Unit) > 0.85 and toMe.Magnitude < 150 then
-                                    if St.autoBlockEnabled and not getgenv().blockState.active then
+                                    if (St.autoBlockEnabled or St.autoPunishEnabled) and not getgenv().blockState.active then
                                         getgenv().blockState.holdFrames = 20
                                         forceStartBlock()
                                     end
@@ -1626,7 +1640,7 @@ do
                     task.delay(track.Length, function() animDebounce[key] = nil end)
 
                     faceTarget(theirHRP)
-                    if St.autoBlockEnabled then
+                    if St.autoBlockEnabled or St.autoPunishEnabled then
                         getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
                         forceStartBlock()
                     end
@@ -1640,7 +1654,7 @@ do
     local enemyData = {}
 
     RunService.Heartbeat:Connect(function()
-        if not St.autoBlockEnabled then
+        if not St.autoBlockEnabled and not St.autoPunishEnabled then
             if getgenv().blockState.active then forceStopBlock() end
             return
         end
@@ -2398,6 +2412,55 @@ local function bfComputeEff()
     lastBFComp = comp
     return math.max(0.05, BF.TIMING + comp - BF.INPUT_LAT)
 end
+-- ============================================================================
+-- MOBILE BLACK FLASH INPUT (touch-driven, joystick-safe)
+-- The black flash is a CLIENT-SIDE timing mechanic: the DivergentFist controller
+-- measures the gap between two Divergent-Fist inputs and only then flags the hit as
+-- a Black Flash. We used to send the keyboard key (Three), but every key press flips
+-- LastInputType to Keyboard, which makes Roblox hide the mobile thumbstick + jump
+-- button. Instead we now drive the SAME pipeline through the on-screen mobile ability
+-- button (Controls.Mobile.Jump.Special): its MouseButton1Down -> ToolController:Special()
+-- and InputEnded -> :ReleaseSpecial() fire the exact RightActivated remote the key does,
+-- but as TOUCH input -- so the flash fires AND the joystick never disappears.
+local SPECIAL_TOUCH_ID = 99231
+local function bfGetSpecialButton()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local controls = pg and pg:FindFirstChild("Controls")
+    local mob = controls and controls:FindFirstChild("Mobile")
+    local jump = mob and mob:FindFirstChild("Jump")
+    return jump and jump:FindFirstChild("Special") or nil
+end
+local function bfTapSpecial(down)
+    -- Returns true if it drove the mobile button (caller then skips the key press).
+    local btn = bfGetSpecialButton()
+    if not btn then return false end
+    local sig = down and btn.MouseButton1Down or btn.InputEnded
+    local fired = false
+    -- Primary: fire the button's own signal handlers directly. This invokes
+    -- ToolController:Special()/:ReleaseSpecial() with ZERO change to LastInputType,
+    -- so the joystick physically cannot vanish, and it's position-independent.
+    if firesignal then
+        pcall(function() firesignal(sig); fired = true end)
+    end
+    if (not fired) and getconnections then
+        local ok, conns = pcall(getconnections, sig)
+        if ok and conns then
+            for _, c in ipairs(conns) do
+                pcall(function() if c.Fire then c:Fire(); fired = true end end)
+            end
+        end
+    end
+    -- Fallback: a real synthetic TOUCH on the button's center. Still keeps the input
+    -- type = Touch (joystick safe) and lands the tap on the Special button. Uses the
+    -- same SendTouchEvent convention as restoreTouchControls (id, state.Value, x, y).
+    if not fired then
+        local center = btn.AbsolutePosition + btn.AbsoluteSize * 0.5
+        local x, y = math.floor(center.X), math.floor(center.Y)
+        local st = down and Enum.UserInputState.Begin.Value or Enum.UserInputState.End.Value
+        pcall(function() VIM:SendTouchEvent(SPECIAL_TOUCH_ID, st, x, y) end)
+    end
+    return true
+end
 local function bfFireCharged(effTime, target, skipOrient)
     if bfActive then return end
     bfActive = true
@@ -2450,17 +2513,18 @@ local function bfFireCharged(effTime, target, skipOrient)
             end)
         end
         -- HIT 1 (charge) -- Black Flash is a CLIENT-SIDE TIMING mechanic: the game's own
-        -- DivergentFist controller measures the gap between these two key presses and only
-        -- THEN flags the hit as a Black Flash. Firing the remote directly (even with the BF
-        -- bool=true) bypasses that flow, so the server treated it as a plain M1 and no
-        -- flash happened -- that's why v35 "dashed + M1'd but never flashed." So we MUST
-        -- send the real key here. The continuous synthetic MOUSE steering that used to hide
-        -- the joystick is already gone, and the per-frame touch guard above keeps the
-        -- thumbstick alive across these two brief key taps.
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+        -- DivergentFist controller measures the gap between the two Divergent-Fist inputs and
+        -- only THEN flags the hit as a Black Flash. Firing the remote directly (even with the
+        -- BF bool=true) bypasses that flow -- that's why v35 "dashed + M1'd but never flashed."
+        -- On MOBILE we now drive that input through the on-screen Special button as TOUCH
+        -- (bfTapSpecial): same controller pipeline as the key, but WITHOUT flipping
+        -- LastInputType to keyboard -- so the flash fires AND the joystick survives. On PC (or
+        -- if the button can't be found) we fall back to the real Three key.
+        local usedTouch1 = mobile and bfTapSpecial(true)
+        if not usedTouch1 then VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game) end
         task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
-        if mobile then restoreTouchControls() end
+        if usedTouch1 then bfTapSpecial(false) else VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game) end
+        if mobile and not usedTouch1 then restoreTouchControls() end
         -- wait the golden interval (down-to-down = effTime), precise at the end
         local target_t = os.clock() + (effTime - BF.HOLD)
         while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
@@ -2469,11 +2533,14 @@ local function bfFireCharged(effTime, target, skipOrient)
         while bfActive and os.clock() < target_t do end
         -- HIT 2 (release the flash) -- the second precisely-timed press is what the
         -- controller reads as a Black Flash and fires with the BF flag set.
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+        -- HIT 2 (release the flash) -- the second precisely-timed input is what the controller
+        -- reads as a Black Flash. Same touch-on-Special path as HIT 1 (key fallback on PC).
+        local usedTouch2 = mobile and bfTapSpecial(true)
+        if not usedTouch2 then VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game) end
         task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+        if usedTouch2 then bfTapSpecial(false) else VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game) end
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
-        if mobile then restoreTouchControls() end
+        if mobile and not usedTouch2 then restoreTouchControls() end
         -- tear down the per-frame guard shortly after the flash, with a final restore pass
         if bfTouchGuard then
             task.delay(0.4, function()
@@ -2704,8 +2771,28 @@ end
         if not target then return false end
         if isDashing or bfActive then return false end
         if isKnockedBack(target) then return false end
+        -- The BF chain keeps a Heartbeat tracker running continuously, so its curved dash always
+        -- has warm velocity/yaw prediction (buttery smooth). Block-break used to call updateTracker
+        -- ONCE then dash with COLD prediction -- that single stale sample is exactly why the block-
+        -- break dash felt choppy next to the BF dash. Keep a live tracker running for the whole
+        -- block-break dash so it predicts the target's motion just like the BF chain does.
         updateTracker(target)
-        return executeCurvedDash(target, { noBF = true, onArrive = onArrive })
+        local bbTracker = RunService.Heartbeat:Connect(function()
+            if not isDashing then return end
+            updateTracker(target)
+        end)
+        local ok = executeCurvedDash(target, { noBF = true, onArrive = onArrive })
+        if ok then
+            task.spawn(function()
+                local t0 = os.clock()
+                repeat RunService.Heartbeat:Wait() until isDashing or (os.clock() - t0) > 0.25
+                repeat RunService.Heartbeat:Wait() until not isDashing
+                if bbTracker then bbTracker:Disconnect(); bbTracker = nil end
+            end)
+        else
+            if bbTracker then bbTracker:Disconnect(); bbTracker = nil end
+        end
+        return ok
     end
 
     _G.bfStartAll = bfStartAll
