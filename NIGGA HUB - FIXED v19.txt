@@ -1282,132 +1282,78 @@ local function stopNanami()
     if Cn.nanamiRatioConn then Cn.nanamiRatioConn:Disconnect(); Cn.nanamiRatioConn = nil end
 end
 
--- ===== Auto Downslam =====
--- Rewrites our own grounded M1 direction (false -> "Down") in-flight, so the combo
--- finisher lands as a downslam. No extra fires, no VirtualInputManager. Leave-on
--- feature gated by St.autoDownslamEnabled. One persistent __namecall hook that
--- chains over any existing hook (the wallhop hook intercepts GetAttribute, not
--- FireServer, so there is no conflict). The M1 remote is resolved per moveset and
--- refreshed on respawn / moveset change.
+-- ===== Auto Downslam (PC + mobile unified) =====
+-- Mechanism (confirmed via decompile of the ToolController melee loop):
+--     local airborne = Humanoid.FloorMaterial == Enum.Material.Air
+--     local jumping  = Humanoid.Jump == true
+--     local dir      = airborne and "Down" or jumping and "Up" or false  -- false = grounded normal hit
+--     ToolController:UseSetService("Activated", dir, GetTarget())
+-- A normal grounded M1 therefore sends dir == false. We intercept that ONE call and, while
+-- the toggle is on, rewrite a NEUTRAL grounded hit (false/nil) into "Down" so every hit lands
+-- as a downslam -- no hop, no re-fire, no client/server desync.
+--
+-- PRIMARY: hook tc.UseSetService at the Lua-table level. Needs NO hookmetamethod, so it works
+--          identically on locked-down mobile executors (Delta/Fluxus) and on PC.
+-- FALLBACK: if UseSetService isn't a plain function on this executor, hook the moveset
+--          service's Activated remote via hookmetamethod (PC-class executors).
 do
-    local dsRemote = nil
-    local function dsLiftOff(c, hum)
-        -- SLIGHT, reliable hop. A plain hum.Jump is suppressed by the combo's Movement state
-        -- mid-combo on mobile, so we ALSO force the Jumping STATE (server treats us as airborne
-        -- and will accept the "Down" finisher) and inject upward velocity. Back to ~50 here (the
-        -- v35 value that reliably registered the downslam): the smaller 28/36 hop left you too close
-        -- to the ground when the finisher fired, so the server saw you grounded and gave a normal
-        -- hit. A reliable downslam beats a prettier small hop.
-        pcall(function() hum.Jump = true end)
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-        local hrp = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart"))
-        if hrp then
-            pcall(function()
-                local v = hrp.AssemblyLinearVelocity
-                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 50, v.Z)
-            end)
-        end
+    -- Only convert a NEUTRAL hit (false/nil). An explicit "Up"/"Down" the game already chose
+    -- (airborne finisher, jump-cancel, etc.) passes through untouched.
+    local function wantDown(dir)
+        return St.autoDownslamEnabled and (dir == false or dir == nil)
     end
-    local function dsAirborne(hum)
-        if not hum then return false end
-        if hum.FloorMaterial == Enum.Material.Air then return true end
-        local st = hum:GetState()
-        return st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping
-    end
-    local function resolveDS()
-        -- The combo FINISHER is NOT on the moveset service -- it's a single shared
-        -- remote: CustomService.RE.Activated:FireServer(direction), where direction is
-        -- false/nil (neutral), "Down" (downslam) or "Up" (upslam). The old code hooked
-        -- the wrong remote, which is why mobile downslam did nothing.
-        local ok, re = pcall(function()
-            return ReplicatedStorage.Knit.Knit.Services.CustomService.RE.Activated
-        end)
-        dsRemote = ok and re or nil
-    end
-    local function watchChar(c)
-        resolveDS()
-        pcall(function() c:GetAttributeChangedSignal("Moveset"):Connect(resolveDS) end)
-        -- RESTORED (with a gentle hop): the server only accepts a "Down" finisher while AIRBORNE,
-        -- and on mobile the combo does NOT pop you off the ground. So we watch the combo counter
-        -- and do a SLIGHT hop once you've thrown the 3rd M1 (CurrentM1 == 4, i.e. as the 4th M1
-        -- begins). v39 hopped at == 3 which jumped a beat too EARLY (right after only the 2nd M1).
-        -- When your 4th M1 then lands you're airborne and the hook below turns it into a downslam. This is the v35 approach
-        -- that actually WORKED; removing it (v36) broke downslam because the in-air swallow/re-fire
-        -- can't reliably leave the ground. dsLiftOff is now a small hop so it isn't too high.
-        pcall(function()
-            c:GetAttributeChangedSignal("CurrentM1"):Connect(function()
-                if not St.autoDownslamEnabled then return end
-                local n = c:GetAttribute("CurrentM1")
-                if n == 4 then
-                    -- MOBILE ONLY. PC already pops off the ground naturally by the finisher, so PC
-                    -- keeps its existing (working) downslam completely untouched -- we ONLY force
-                    -- the hop on mobile. This is what you asked for: don't touch the PC downslam.
-                    local hum = c:FindFirstChildOfClass("Humanoid")
-                    if mobile and hum and not dsAirborne(hum) then
-                        dsLiftOff(c, hum)
-                        -- KEEP us airborne for a short window. The finisher remote fires a fraction
-                        -- of a second AFTER CurrentM1 hits 4, and a single velocity pulse can already
-                        -- be decaying (or we've landed) by then -- so the server saw us grounded and
-                        -- gave a NORMAL hit ("sometimes downslams, sometimes doesn't"). Re-assert
-                        -- upward velocity until the finisher lands so we're DEFINITELY airborne.
-                        task.spawn(function()
-                            local hrp = c.PrimaryPart or c:FindFirstChild("HumanoidRootPart")
-                            if not hrp then return end
-                            local t0 = os.clock()
-                            while os.clock() - t0 < 0.35 do
-                                if not dsAirborne(hum) then
-                                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-                                    local v = hrp.AssemblyLinearVelocity
-                                    if v.Y < 10 then hrp.AssemblyLinearVelocity = Vector3.new(v.X, 30, v.Z) end
-                                end
-                                RunService.Heartbeat:Wait()
-                            end
-                        end)
-                    end
-                end
-            end)
-        end)
-    end
-    if LocalPlayer.Character then watchChar(LocalPlayer.Character) end
-    LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
 
-    local oldDS
-    local function dsHook(self, ...)
-        if St.autoDownslamEnabled and self == dsRemote and getnamecallmethod() == "FireServer" then
-            local a = { ... }
-            local d = a[1]
-            -- arg1 of the finisher is the DIRECTION: false/nil = neutral, "Down" =
-            -- downslam, "Up" = upslam. Only convert a NEUTRAL finisher into a downslam;
-            -- leave an explicit "Up"/"Down" the user fired themselves untouched.
-            if d == false or d == nil then
-                local ch = LocalPlayer.Character
-                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-                -- The SERVER only accepts a "Down" finisher while AIRBORNE. If you're not airborne
-                -- yet when your 4th M1 fires, force the airborne STATE *synchronously* right here
-                -- (Jump + Jumping state + a small upward velocity), then fire "Down" IN PLACE.
-                -- We do NOT swallow the send and re-fire it later anymore: that desynced the client
-                -- and server combo (the server never received the finisher, so the delayed re-fire
-                -- arrived out-of-combo and you just got a NORMAL M1 -- exactly why it only worked
-                -- when you went slowly). Converting your real finisher in place keeps the combo in
-                -- sync with the server, so it downslams every time. The CurrentM1==4 pre-hop above
-                -- already lifts you a beat earlier so you're usually airborne before this even runs.
-                if mobile and hum and not dsAirborne(hum) then
-                    -- MOBILE ONLY hop (see above) -- PC is left to its natural airborne finisher.
-                    dsLiftOff(ch, hum)
+    -- ---- PRIMARY: ToolController.UseSetService table hook (PC + mobile) ----
+    local ussHooked = false
+    pcall(function()
+        local tc = nhGetToolController()
+        if tc and type(tc.UseSetService) == "function" then
+            -- Safe re-run: if we already hooked this controller, restore first so we never wrap
+            -- our own wrapper (which would capture the hooked fn as the "original").
+            if _G.NH_origUSS then pcall(function() tc.UseSetService = _G.NH_origUSS end) end
+            _G.NH_origUSS = tc.UseSetService
+            tc.UseSetService = function(self, name, dir, ...)
+                if name == "Activated" and wantDown(dir) then
+                    dir = "Down"
                 end
-                return oldDS(self, "Down")
+                return _G.NH_origUSS(self, name, dir, ...)
             end
+            ussHooked = true
         end
-        return oldDS(self, ...)
-    end
-    -- Install the finisher hook behind a pcall: a few mobile executors don't support
-    -- hookmetamethod. If it isn't supported here, the rest of the hub still loads fine
-    -- (auto-downslam simply won't convert the finisher). Since your downslam currently
-    -- works, your executor DOES support it -- this just makes the script crash-proof.
-    local dsHookOk = pcall(function()
-        oldDS = hookmetamethod(game, "__namecall", dsHook)
     end)
-    if not dsHookOk then warn("[NH] auto-downslam: hookmetamethod not supported on this executor") end
+
+    -- ---- FALLBACK: __namecall hook on the moveset's Activated remote ----
+    -- Resolves the per-moveset remote (e.g. DivergentFistService.RE.Activated) and refreshes it
+    -- on moveset change. Only installed when the table hook could not be installed.
+    if not ussHooked then
+        local dsRemote = nil
+        local function resolveDS()
+            local ok, re = pcall(function()
+                local mv = LocalPlayer:GetAttribute("Moveset")
+                return ReplicatedStorage.Knit.Knit.Services[(tostring(mv):gsub("%s", "")) .. "Service"].RE.Activated
+            end)
+            dsRemote = ok and re or nil
+        end
+        resolveDS()
+        pcall(function() LocalPlayer:GetAttributeChangedSignal("Moveset"):Connect(resolveDS) end)
+        pcall(function() LocalPlayer.CharacterAdded:Connect(function() task.wait(0.3) resolveDS() end) end)
+
+        local oldDS
+        local function dsHook(self, ...)
+            if self == dsRemote and getnamecallmethod() == "FireServer" then
+                local a = { ... }
+                if wantDown(a[1]) then
+                    a[1] = "Down"
+                    return oldDS(self, unpack(a))
+                end
+            end
+            return oldDS(self, ...)
+        end
+        local okHook = pcall(function() oldDS = hookmetamethod(game, "__namecall", dsHook) end)
+        if not okHook then
+            warn("[NH] auto-downslam: neither UseSetService nor hookmetamethod is available on this executor")
+        end
+    end
 end
 
 local function startAutoQTE()
