@@ -284,32 +284,25 @@ local function restoreTouchControls()
         cornerTouch(Enum.UserInputState.End.Value)
     end)
 end
--- LIGHTWEIGHT per-frame force: just flips the master TouchGui + the thumbstick/jump frame
--- back on. Cheap enough to call every RenderStepped frame (no require, no SendTouchEvent),
--- which is the only way to keep the controls from blinking out while we spam synthetic keys.
+-- LIGHTWEIGHT per-frame force: pin ToolController.LastInput = "Mobile" EVERY frame
+-- (no throttle) so the game's own RenderStepped loop SUSTAINS Controls.Mobile.
+-- Live trace confirmed: TouchGui does NOT exist in this game. The joystick lives
+-- entirely in PlayerGui.Controls.Mobile. tc.LastInput is the only field that matters.
 local function forceTouchVisible()
     if not mobile then return end
+    -- Pin tc.LastInput every frame - this is what the game reads to decide visibility.
+    -- Any throttle here (even 0.1s) lets the game's own loop win between our frames.
+    local tc = NH_ToolController
+    if tc then tc.LastInput = "Mobile" end
+    -- Also keep Mobile.Visible = true directly as a belt-and-suspenders.
     pcall(function()
         local pg = LocalPlayer:FindFirstChild("PlayerGui")
-        local tg = pg and pg:FindFirstChild("TouchGui")
-        if tg then
-            if not tg.Enabled then tg.Enabled = true end
-            local tcf = tg:FindFirstChild("TouchControlFrame")
-            if tcf and not tcf.Visible then tcf.Visible = true end
-        end
-        -- ALSO keep the game's OWN mobile controls (PlayerGui.Controls.Mobile -- the real
-        -- joystick + jump + ability buttons) shown every frame; the synthetic BF key keeps
-        -- hiding this game GUI, and THAT -- not the default TouchGui -- is the joystick you lose.
         local controls = pg and pg:FindFirstChild("Controls")
         if controls then
-            if controls:IsA("ScreenGui") and not controls.Enabled then controls.Enabled = true end
+            if not controls.Enabled then controls.Enabled = true end
             local mob = controls:FindFirstChild("Mobile")
-            if mob and mob:IsA("GuiObject") and not mob.Visible then mob.Visible = true end
+            if mob and not mob.Visible then mob.Visible = true end
         end
-        -- Keep ToolController.LastInput == "Mobile" so the game's own RenderStepped loop SUSTAINS
-        -- Controls.Mobile (forcing Mobile.Visible alone loses to that loop unless LastInput matches).
-        local tc = NH_ToolController
-        if tc then tc.LastInput = "Mobile" end
     end)
 end
 -- re-assert across a few frames so it wins regardless of signal ordering with the engine
@@ -1292,13 +1285,10 @@ end
 do
     local dsRemote = nil
     local function dsLiftOff(c, hum)
-        -- SLIGHT, reliable hop. A plain hum.Jump is suppressed by the combo's Movement state
-        -- mid-combo on mobile, so we ALSO force the Jumping STATE (server treats us as airborne
-        -- and will accept the "Down" finisher) and inject upward velocity. Back to ~50 here (the
-        -- v35 value that reliably registered the downslam): the smaller 28/36 hop left you too close
-        -- to the ground when the finisher fired, so the server saw you grounded and gave a normal
-        -- hit. A reliable downslam beats a prettier small hop.
-        pcall(function() hum.Jump = true end)
+        -- Skip hum.Jump entirely. Live trace confirmed: on mobile the combo's Movement
+        -- attribute suppresses the Jump property mid-combo, so it silently no-ops.
+        -- Go straight to ChangeState(Jumping) + inject upward velocity. This bypasses
+        -- the Movement gate and guarantees the server sees us as airborne.
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
         local hrp = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart"))
         if hrp then
@@ -1354,7 +1344,9 @@ do
                             local hrp = c.PrimaryPart or c:FindFirstChild("HumanoidRootPart")
                             if not hrp then return end
                             local t0 = os.clock()
-                            while os.clock() - t0 < 0.35 do
+                            -- Extended to 0.5s: mobile frames are slower and the finisher can
+                            -- arrive late. 0.35s was decaying before the hook converted it.
+                            while os.clock() - t0 < 0.5 do
                                 if not dsAirborne(hum) then
                                     pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
                                     local v = hrp.AssemblyLinearVelocity
@@ -2624,19 +2616,15 @@ local function bfFireCharged(effTime, target, skipOrient)
         -- any re-chain, hid them again). So we run a throttled per-frame guard for the whole
         -- flash that re-shows the controls the instant they vanish, AND restore right after
         -- EVERY key release.
-        local bfTouchGuard, bfGuardLast = nil, 0
+        local bfTouchGuard = nil
         if mobile then
-            -- Force the joystick + jump button visible EVERY frame for the whole flash
-            -- (lightweight), plus a heavier control re-assert ~10x/sec. The synthetic move
-            -- key keeps flipping input to "keyboard" (which hides touch controls), so a
-            -- per-frame force is the only way to stop them blinking out during a chain.
+            -- Pin tc.LastInput = "Mobile" EVERY frame, no throttle.
+            -- Live trace: tc.LastInput was stuck "Keyboard" and the game's own RenderStepped
+            -- loop reads it to decide Controls.Mobile visibility. Any gap (even 0.1s) lets
+            -- the game loop win and hide the joystick between our frames. forceTouchVisible()
+            -- now pins LastInput without throttle - that's all that's needed.
             bfTouchGuard = RunService.RenderStepped:Connect(function()
                 forceTouchVisible()
-                local now = os.clock()
-                if now - bfGuardLast > 0.1 then
-                    bfGuardLast = now
-                    if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then restoreTouchControls() end
-                end
             end)
         end
         -- HIT 1 (charge) -- Black Flash is a CLIENT-SIDE TIMING mechanic: the game's own
