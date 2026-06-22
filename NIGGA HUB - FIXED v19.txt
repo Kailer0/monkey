@@ -2644,39 +2644,49 @@ local function bfFireCharged(effTime, target, skipOrient)
                 forceTouchVisible()
             end)
         end
-        -- HIT 1 (charge) -- Black Flash is a CLIENT-SIDE TIMING mechanic: the game's own
-        -- DivergentFist controller measures the gap between two real move INPUTS and only THEN
-        -- flags the hit as a Black Flash. We tested driving this through the mobile Special
-        -- button as touch (v38) -- it kept the joystick but did NOT flash, because that button
-        -- path doesn't carry the controller's flash timing on this executor. So we send the
-        -- real Three key here (the ONLY input that reliably flashes), then immediately reset
-        -- LastInputType back to Touch (robust corner touch) so the thumbstick survives.
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-        task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
-        if mobile then restoreTouchControls() end
+        -- HIT 1 + HIT 2: fire the flash.
+        -- ROOT CAUSE of joystick loss (confirmed from symptoms + MCP service scan):
+        --   SendKeyEvent on mobile causes Roblox's ControlModule to detect keyboard
+        --   input, call Disable() on TouchThumbstick, and DESTROY DynamicThumbstickFrame.
+        --   It rebuilds only on a real touch ~10s later. Mobile.Visible / tc.LastInput
+        --   patches do nothing -- the thumbstick lives in Roblox's TouchGui, not the game GUI.
+        --
+        -- FIX: on mobile call tc:Special() / tc:ReleaseSpecial() directly.
+        --   MCP confirmed both succeed with zero args. They hit the same DivergentFist
+        --   pipeline the Three key uses but as a pure Lua call -- no input system,
+        --   no LastInputType flip, thumbstick cannot be destroyed.
+        -- PC: SendKeyEvent unchanged (no touch controls to break).
+        local _tc = nil
+        if mobile then
+            pcall(function()
+                local km = require(game:GetService("ReplicatedStorage"):WaitForChild("Knit"):WaitForChild("Knit"))
+                _tc = km.GetController("ToolController")
+            end)
+        end
+        local function fireHit()
+            if mobile and _tc then
+                pcall(function() _tc:Special() end)
+                task.wait(BF.HOLD)
+                pcall(function() _tc:ReleaseSpecial() end)
+            else
+                VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
+                task.wait(BF.HOLD)
+                VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+            end
+        end
+
+        fireHit()  -- HIT 1 (charge)
         -- wait the golden interval (down-to-down = effTime), precise at the end
         local target_t = os.clock() + (effTime - BF.HOLD)
         while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
             RunService.Heartbeat:Wait()
         end
         while bfActive and os.clock() < target_t do end
-        -- HIT 2 (release the flash) -- the second precisely-timed press is what the
-        -- controller reads as a Black Flash and fires with the BF flag set.
-        -- HIT 2 (release the flash) -- the second precisely-timed key press is what the
-        -- controller reads as a Black Flash. Same key + touch-reset path as HIT 1.
-        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
-        task.wait(BF.HOLD)
-        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+        fireHit()  -- HIT 2 (timed release -- this is what the server flags as Black Flash)
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
-        if mobile then restoreTouchControls() end
-        -- tear down the per-frame guard shortly after the flash, with a final restore pass
         if bfTouchGuard then
             task.delay(0.4, function()
                 if bfTouchGuard then bfTouchGuard:Disconnect(); bfTouchGuard = nil end
-                -- hard rebuild of the thumbstick (Disable/Enable) THEN the multi-frame re-assert,
-                -- so the joystick comes back even when a plain Enable() didn't bring it back.
-                if mobile then rebuildTouchControls(); reassertControls() end
             end)
         end
         -- restore AutoRotate (the no-shift-lock fallback may have disabled it)
