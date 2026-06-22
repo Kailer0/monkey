@@ -197,6 +197,27 @@ local function restoreTouchControls()
         local tg = pg and pg:FindFirstChild("TouchGui")
         if tg and not tg.Enabled then tg.Enabled = true end
     end)
+    -- (2b) THE ACTUAL FIX for "the BF chain eats my joystick": Jujutsu Shenanigans does NOT use
+    -- Roblox's default thumbstick. It has its OWN on-screen controls at PlayerGui.Controls (a
+    -- ScreenGui) with a "Mobile" frame -- that frame IS your joystick + jump + ability buttons
+    -- (it's where the Special button lives). The game HIDES this whole GUI the instant
+    -- LastInputType flips to Keyboard, which our synthetic BF key does. Re-enabling only the
+    -- default TouchGui above never brought your stick back because the stick lives HERE. Force
+    -- the game's own controls GUI + its Mobile frame (and direct children) visible again.
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        local controls = pg and pg:FindFirstChild("Controls")
+        if controls then
+            if controls:IsA("ScreenGui") and not controls.Enabled then controls.Enabled = true end
+            local mob = controls:FindFirstChild("Mobile")
+            if mob then
+                if mob:IsA("GuiObject") and not mob.Visible then mob.Visible = true end
+                for _, ch in ipairs(mob:GetChildren()) do
+                    if ch:IsA("GuiObject") and not ch.Visible then ch.Visible = true end
+                end
+            end
+        end
+    end)
     -- (3) THE KEY FIX: our synthetic KEYBOARD event (the BF move key) flipped
     -- UserInputService.LastInputType to Keyboard, so Roblox's control module HID the
     -- thumbstick/jump until the next *real* touch -- which never came, so they were
@@ -230,6 +251,15 @@ local function forceTouchVisible()
             if not tg.Enabled then tg.Enabled = true end
             local tcf = tg:FindFirstChild("TouchControlFrame")
             if tcf and not tcf.Visible then tcf.Visible = true end
+        end
+        -- ALSO keep the game's OWN mobile controls (PlayerGui.Controls.Mobile -- the real
+        -- joystick + jump + ability buttons) shown every frame; the synthetic BF key keeps
+        -- hiding this game GUI, and THAT -- not the default TouchGui -- is the joystick you lose.
+        local controls = pg and pg:FindFirstChild("Controls")
+        if controls then
+            if controls:IsA("ScreenGui") and not controls.Enabled then controls.Enabled = true end
+            local mob = controls:FindFirstChild("Mobile")
+            if mob and mob:IsA("GuiObject") and not mob.Visible then mob.Visible = true end
         end
     end)
 end
@@ -1270,9 +1300,8 @@ do
     LocalPlayer.CharacterAdded:Connect(function(c) task.wait(0.3) watchChar(c) end)
 
     local oldDS
-    local dsRefiring = false
     local function dsHook(self, ...)
-        if St.autoDownslamEnabled and not dsRefiring and self == dsRemote and getnamecallmethod() == "FireServer" then
+        if St.autoDownslamEnabled and self == dsRemote and getnamecallmethod() == "FireServer" then
             local a = { ... }
             local d = a[1]
             -- arg1 of the finisher is the DIRECTION: false/nil = neutral, "Down" =
@@ -1281,22 +1310,17 @@ do
             if d == false or d == nil then
                 local ch = LocalPlayer.Character
                 local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-                -- The SERVER only accepts a "Down" finisher while AIRBORNE. On PC the
-                -- combo already pops you off the ground by the finisher; on mobile it
-                -- usually doesn't -- THAT is the real reason mobile downslam did nothing.
-                -- If grounded: hop, wait until actually airborne, THEN fire "Down"
-                -- (swallow the grounded send, re-fire in the air). One fire per combo.
+                -- The SERVER only accepts a "Down" finisher while AIRBORNE. If you're not airborne
+                -- yet when your 4th M1 fires, force the airborne STATE *synchronously* right here
+                -- (Jump + Jumping state + a small upward velocity), then fire "Down" IN PLACE.
+                -- We do NOT swallow the send and re-fire it later anymore: that desynced the client
+                -- and server combo (the server never received the finisher, so the delayed re-fire
+                -- arrived out-of-combo and you just got a NORMAL M1 -- exactly why it only worked
+                -- when you went slowly). Converting your real finisher in place keeps the combo in
+                -- sync with the server, so it downslams every time. The CurrentM1==4 pre-hop above
+                -- already lifts you a beat earlier so you're usually airborne before this even runs.
                 if hum and not dsAirborne(hum) then
-                    dsRefiring = true
-                    task.spawn(function()
-                        dsLiftOff(ch, hum)
-                        local t0 = os.clock()
-                        repeat RunService.Heartbeat:Wait() until dsAirborne(hum) or (os.clock() - t0) > 1.0
-                        pcall(function() oldDS(dsRemote, "Down") end)
-                        task.wait(0.05)
-                        dsRefiring = false
-                    end)
-                    return
+                    dsLiftOff(ch, hum)
                 end
                 return oldDS(self, "Down")
             end
