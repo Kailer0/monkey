@@ -204,8 +204,18 @@ local function restoreTouchControls()
     -- so the engine immediately re-shows the on-screen controls.
     pcall(function()
         local id = 91237
-        VirtualInputManager:SendTouchEvent(id, Enum.UserInputState.Begin.Value, 3, 3)
-        VirtualInputManager:SendTouchEvent(id, Enum.UserInputState.End.Value, 3, 3)
+        -- Reset LastInputType to Touch so the engine re-shows the thumbstick + jump button.
+        -- Executors DISAGREE on SendTouchEvent's argument order, and if we use the wrong one it
+        -- silently no-ops (caught by pcall) -- which is exactly why the synthetic key used to
+        -- kill the joystick "for good": the reset never actually registered. So we fire BOTH
+        -- common forms; whichever the executor accepts registers a real touch (the position is
+        -- irrelevant for the input-type reset), and the DynamicThumbstick is rebuilt.
+        local function cornerTouch(stateVal)
+            pcall(function() VirtualInputManager:SendTouchEvent(id, stateVal, 3, 3) end) -- (id, state, x, y)
+            pcall(function() VirtualInputManager:SendTouchEvent(id, 3, 3, stateVal) end) -- (id, x, y, state)
+        end
+        cornerTouch(Enum.UserInputState.Begin.Value)
+        cornerTouch(Enum.UserInputState.End.Value)
     end)
 end
 -- LIGHTWEIGHT per-frame force: just flips the master TouchGui + the thumbstick/jump frame
@@ -1194,7 +1204,7 @@ do
         if hrp then
             pcall(function()
                 local v = hrp.AssemblyLinearVelocity
-                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 28, v.Z)
+                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 36, v.Z)
             end)
         end
     end
@@ -2513,18 +2523,16 @@ local function bfFireCharged(effTime, target, skipOrient)
             end)
         end
         -- HIT 1 (charge) -- Black Flash is a CLIENT-SIDE TIMING mechanic: the game's own
-        -- DivergentFist controller measures the gap between the two Divergent-Fist inputs and
-        -- only THEN flags the hit as a Black Flash. Firing the remote directly (even with the
-        -- BF bool=true) bypasses that flow -- that's why v35 "dashed + M1'd but never flashed."
-        -- On MOBILE we now drive that input through the on-screen Special button as TOUCH
-        -- (bfTapSpecial): same controller pipeline as the key, but WITHOUT flipping
-        -- LastInputType to keyboard -- so the flash fires AND the joystick survives. On PC (or
-        -- if the button can't be found) we fall back to the real Three key.
-        local usedTouch1 = mobile and bfTapSpecial(true)
-        if not usedTouch1 then VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game) end
+        -- DivergentFist controller measures the gap between two real move INPUTS and only THEN
+        -- flags the hit as a Black Flash. We tested driving this through the mobile Special
+        -- button as touch (v38) -- it kept the joystick but did NOT flash, because that button
+        -- path doesn't carry the controller's flash timing on this executor. So we send the
+        -- real Three key here (the ONLY input that reliably flashes), then immediately reset
+        -- LastInputType back to Touch (robust corner touch) so the thumbstick survives.
+        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
         task.wait(BF.HOLD)
-        if usedTouch1 then bfTapSpecial(false) else VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game) end
-        if mobile and not usedTouch1 then restoreTouchControls() end
+        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
+        if mobile then restoreTouchControls() end
         -- wait the golden interval (down-to-down = effTime), precise at the end
         local target_t = os.clock() + (effTime - BF.HOLD)
         while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
@@ -2533,14 +2541,13 @@ local function bfFireCharged(effTime, target, skipOrient)
         while bfActive and os.clock() < target_t do end
         -- HIT 2 (release the flash) -- the second precisely-timed press is what the
         -- controller reads as a Black Flash and fires with the BF flag set.
-        -- HIT 2 (release the flash) -- the second precisely-timed input is what the controller
-        -- reads as a Black Flash. Same touch-on-Special path as HIT 1 (key fallback on PC).
-        local usedTouch2 = mobile and bfTapSpecial(true)
-        if not usedTouch2 then VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game) end
+        -- HIT 2 (release the flash) -- the second precisely-timed key press is what the
+        -- controller reads as a Black Flash. Same key + touch-reset path as HIT 1.
+        VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
         task.wait(BF.HOLD)
-        if usedTouch2 then bfTapSpecial(false) else VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game) end
+        VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
-        if mobile and not usedTouch2 then restoreTouchControls() end
+        if mobile then restoreTouchControls() end
         -- tear down the per-frame guard shortly after the flash, with a final restore pass
         if bfTouchGuard then
             task.delay(0.4, function()
