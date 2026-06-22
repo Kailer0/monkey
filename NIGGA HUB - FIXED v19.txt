@@ -2079,6 +2079,7 @@ local BF = {
     INPUT_LAT   = 0.012,
     PING_SMOOTH = 0.40,
     FINE_SPIN   = 0.003,
+    SPAM_COOLDOWN = 0.12, -- min idle window after a flash completes before another can start (anti-spam settle so the game's move state resets)
 }
 
 local lastDashTime   = 0
@@ -2086,6 +2087,7 @@ local isDashing      = false
 local dashConnection = nil
 local movementController = nil
 local bfActive       = false
+local bfBusy         = false  -- sequence lock: held across chain-dash + BOTH hits so spam-taps are DROPPED, never interleaved (interleaving downgrades BF to a normal Divergent Fist)
 local trackedModel, lastTPos, lastTLook, lastSampleT
 local estVel         = Vector3.zero
 local estAccel       = Vector3.zero
@@ -2622,6 +2624,7 @@ end
 local function bfFireCharged(effTime, target, skipOrient)
     if bfActive then return end
     bfActive = true
+    bfBusy   = true
     task.spawn(function()
         -- Resolve a fresh target part each frame (it can move/respawn mid-flash).
         local function targetPart()
@@ -2709,10 +2712,14 @@ local function bfFireCharged(effTime, target, skipOrient)
             if fhum then pcall(function() fhum.AutoRotate = true end) end
         end
         bfActive = false
+        -- Hold the sequence lock a hair longer so an immediate re-tap can't collide with the
+        -- game's post-Black-Flash move state (a too-soon press is read as a normal Divergent Fist).
+        task.delay(BF.SPAM_COOLDOWN or 0.12, function() bfBusy = false end)
     end)
 end
 local function startBlackFlash(target)
-    if bfActive then return end
+    if bfActive or bfBusy then return end
+    bfBusy = true  -- claim the WHOLE sequence up-front, BEFORE chainCorrectionDash yields, so rapid re-taps are dropped instead of spawning overlapping flashes
     if target and CHAIN_CORRECT_ENABLED and not alreadyAtBack(target) then
         local _, predBack = predictBack(target, PREDICT_LEAD)
         local char = getCharacter()
@@ -2868,7 +2875,7 @@ end
     local trackerConn = nil
     local function bfTriggerDash_inner()
         if not St.bfEnabled then return end
-        if isDashing or bfActive then return end
+        if isDashing or bfActive or bfBusy then return end
         local target, dist = findTarget()
         if not target then return end
         if isKnockedBack(target) then return end
@@ -2893,6 +2900,7 @@ end
         if dashConnection then pcall(function() dashConnection:Disconnect() end); dashConnection = nil end
         isDashing    = false
         bfActive     = false
+        bfBusy       = false
         trackedModel = nil
         pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end)
         -- make sure AutoRotate isn't left disabled if a fire was interrupted mid-chain
@@ -2923,7 +2931,7 @@ end
     -- onArrive() (used by Auto Block Break to M1 a blocker's exposed back).
     _G.NH_dashBehind = function(target, onArrive)
         if not target then return false end
-        if isDashing or bfActive then return false end
+        if isDashing or bfActive or bfBusy then return false end
         if isKnockedBack(target) then return false end
         -- REVERTED to the pre-v37 (v36) block-break dash at your request: one tracker sample then
         -- a straight curved dash, NO continuous bbTracker. You said the older one was better, so this
