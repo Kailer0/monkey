@@ -22,7 +22,24 @@ local CoreGui           = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = Workspace.CurrentCamera
-local mobile      = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+-- UIS.TouchEnabled = false / KeyboardEnabled = true on mobile executors (confirmed by
+-- live MCP trace). The old single-line check always evaluated to FALSE on your phone,
+-- making EVERY "if mobile then" block dead code — joystick guard, BF restore, downslam
+-- hop, all of it silently never ran. Detect mobile from the game's own data instead.
+local function detectMobile()
+    -- Primary: game creates Controls.Mobile only on touch devices (live-confirmed present)
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local controls = pg and pg:FindFirstChild("Controls")
+    if controls and controls:FindFirstChild("Mobile") then return true end
+    -- Secondary: CollectionService "Mobile" tag — game tags its own Mobile:Frame
+    local CS = game:GetService("CollectionService")
+    for _, obj in ipairs(CS:GetTagged("Mobile")) do
+        if obj:IsA("GuiObject") then return true end
+    end
+    -- Fallback only: original UIS check (unreliable on executors but keep as last resort)
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
+local mobile = detectMobile()
 local _lastDomainRebuild = 0
 
 _G.mainFloatGuis = {}
