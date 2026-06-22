@@ -2649,27 +2649,10 @@ local function bfFireCharged(effTime, target, skipOrient)
         if mobile and target then
             faceCharToTarget()
         end
-        -- MOBILE: keep the on-screen joystick + jump button ALIVE for the ENTIRE flash.
-        -- Each synthetic move key flips LastInputType to keyboard, which makes Roblox hide
-        -- the touch controls. One restore AFTER the chain wasn't enough (the 2nd key, and
-        -- any re-chain, hid them again). So we run a throttled per-frame guard for the whole
-        -- flash that re-shows the controls the instant they vanish, AND restore right after
-        -- EVERY key release.
-        local bfTouchGuard, bfGuardLast = nil, 0
-        if mobile then
-            -- Force the joystick + jump button visible EVERY frame for the whole flash
-            -- (lightweight), plus a heavier control re-assert ~10x/sec. The synthetic move
-            -- key keeps flipping input to "keyboard" (which hides touch controls), so a
-            -- per-frame force is the only way to stop them blinking out during a chain.
-            bfTouchGuard = RunService.RenderStepped:Connect(function()
-                forceTouchVisible()
-                local now = os.clock()
-                if now - bfGuardLast > 0.1 then
-                    bfGuardLast = now
-                    if UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch then restoreTouchControls() end
-                end
-            end)
-        end
+        -- MOBILE: tc:UseKey keeps LastInputType = Touch, so the engine NEVER hides the joystick
+        -- or jump button during the flash. So we run NO per-frame touch guard and NO control
+        -- rebuild => movement stays live the whole time and is usable the INSTANT the chain
+        -- ends (this removes the ~1s post-flash joystick freeze; matches the proven script).
         -- HIT 1 (charge) -- Black Flash is a CLIENT-SIDE TIMING mechanic: the game's own
         -- DivergentFist controller measures the gap between two real move INPUTS and only THEN
         -- flags the hit as a Black Flash. We tested driving this through the mobile Special
@@ -2692,7 +2675,6 @@ local function bfFireCharged(effTime, target, skipOrient)
             task.wait(BF.HOLD)
             VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         end
-        if mobile then restoreTouchControls() end
         -- wait the golden inter-hit interval, precise at the end. Both platforms use the SAME
         -- timing (effTime, ~0.26): the charge->release flash window is identical; only the INPUT
         -- method differs (mobile = tc:UseKey, PC = VIM key). Matches the proven mobile script.
@@ -2718,16 +2700,8 @@ local function bfFireCharged(effTime, target, skipOrient)
             VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         end
         if faceBound then pcall(function() RunService:UnbindFromRenderStep("NH_bfFace") end) end
-        if mobile then restoreTouchControls() end
-        -- tear down the per-frame guard shortly after the flash, with a final restore pass
-        if bfTouchGuard then
-            task.delay(0.4, function()
-                if bfTouchGuard then bfTouchGuard:Disconnect(); bfTouchGuard = nil end
-                -- hard rebuild of the thumbstick (Disable/Enable) THEN the multi-frame re-assert,
-                -- so the joystick comes back even when a plain Enable() didn't bring it back.
-                if mobile then rebuildTouchControls(); reassertControls() end
-            end)
-        end
+        -- No touch-control restore/rebuild on mobile: tc:UseKey never hid them, so the joystick
+        -- is already live. Doing a Disable/Enable rebuild here is what caused the post-flash freeze.
         -- restore AutoRotate (the no-shift-lock fallback may have disabled it)
         do
             local fch = getCharacter()
