@@ -17,6 +17,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Debris            = game:GetService("Debris")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local VirtualUser       = game:GetService("VirtualUser")
+local CollectionService = game:GetService("CollectionService")
 local CoreGui           = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
@@ -176,6 +177,46 @@ end)
 -- until the next real touch. This guard re-enables the touch controls the instant
 -- that happens, so faking input can never take the player's movement UI again.
 -- ============================================================
+-- ============================================================
+-- GAME'S OWN MOBILE BUTTONS (PlayerGui.Controls.Mobile: Melee/Block/Dash/Special/ShiftLock)
+-- ------------------------------------------------------------
+-- Confirmed by live source inspection of ToolController: a RenderStepped loop only KEEPS
+-- Controls.Mobile visible WHILE ToolController.LastInput == "Mobile". Our synthetic BF key flips
+-- UserInputService.PreferredInput -> KeyboardAndMouse, so the game sets LastInput = "Keyboard",
+-- runs its tag-visibility pass (hiding every "Mobile"-tagged GuiObject), and the loop then STOPS
+-- touching Mobile -- so just forcing Mobile.Visible = true loses again the very next frame.
+-- THE reliable fix (no real touch required): (1) patch ToolController.LastInput back to "Mobile"
+-- so the loop re-shows AND sustains the buttons, and (2) re-run the CollectionService tag pass
+-- ourselves (exactly what the game's internal u19() does).
+local NH_ToolController = nil
+local function nhGetToolController()
+    if NH_ToolController then return NH_ToolController end
+    pcall(function()
+        local Knit = require(ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit"))
+        NH_ToolController = Knit.GetController("ToolController")
+    end)
+    return NH_ToolController
+end
+local function restoreMobileControls()
+    if not mobile then return end
+    -- (1) Patch the field the game's RenderStepped loop reads, so it re-shows + SUSTAINS the buttons.
+    pcall(function()
+        local tc = nhGetToolController()
+        if tc then tc.LastInput = "Mobile" end
+    end)
+    -- (2) Re-run the platform tag visibility (mirror of the game's u19()): hide non-touch UI, then
+    -- show every "Mobile"-tagged GuiObject (Controls.Mobile is tagged "Mobile").
+    pcall(function()
+        for _, platform in ipairs({ "Keyboard", "Playstation", "Xbox" }) do
+            for _, obj in ipairs(CollectionService:GetTagged(platform)) do
+                if obj:IsA("GuiObject") then obj.Visible = false end
+            end
+        end
+        for _, obj in ipairs(CollectionService:GetTagged("Mobile")) do
+            if obj:IsA("GuiObject") then obj.Visible = true end
+        end
+    end)
+end
 local function restoreTouchControls()
     if not mobile then return end
     -- (1) Re-enable the control module. Re-acquire a FRESH handle if our cached one
@@ -218,6 +259,10 @@ local function restoreTouchControls()
             end
         end
     end)
+    -- (2c) Patch ToolController.LastInput back to "Mobile" + re-run the CollectionService tag pass
+    -- so the game's OWN RenderStepped loop re-shows and SUSTAINS Controls.Mobile every frame. This
+    -- is the real "the buttons live here and the game keeps hiding them" fix (per source).
+    restoreMobileControls()
     -- (3) THE KEY FIX: our synthetic KEYBOARD event (the BF move key) flipped
     -- UserInputService.LastInputType to Keyboard, so Roblox's control module HID the
     -- thumbstick/jump until the next *real* touch -- which never came, so they were
@@ -261,6 +306,10 @@ local function forceTouchVisible()
             local mob = controls:FindFirstChild("Mobile")
             if mob and mob:IsA("GuiObject") and not mob.Visible then mob.Visible = true end
         end
+        -- Keep ToolController.LastInput == "Mobile" so the game's own RenderStepped loop SUSTAINS
+        -- Controls.Mobile (forcing Mobile.Visible alone loses to that loop unless LastInput matches).
+        local tc = NH_ToolController
+        if tc then tc.LastInput = "Mobile" end
     end)
 end
 -- re-assert across a few frames so it wins regardless of signal ordering with the engine
@@ -1245,15 +1294,17 @@ do
     local function dsLiftOff(c, hum)
         -- SLIGHT, reliable hop. A plain hum.Jump is suppressed by the combo's Movement state
         -- mid-combo on mobile, so we ALSO force the Jumping STATE (server treats us as airborne
-        -- and will accept the "Down" finisher) and inject a SMALL upward velocity. v35 used 50
-        -- here which launched you way too high/choppy; 28 just lifts the feet off the ground.
+        -- and will accept the "Down" finisher) and inject upward velocity. Back to ~50 here (the
+        -- v35 value that reliably registered the downslam): the smaller 28/36 hop left you too close
+        -- to the ground when the finisher fired, so the server saw you grounded and gave a normal
+        -- hit. A reliable downslam beats a prettier small hop.
         pcall(function() hum.Jump = true end)
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
         local hrp = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart"))
         if hrp then
             pcall(function()
                 local v = hrp.AssemblyLinearVelocity
-                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 36, v.Z)
+                hrp.AssemblyLinearVelocity = Vector3.new(v.X, 50, v.Z)
             end)
         end
     end
@@ -1288,9 +1339,30 @@ do
                 if not St.autoDownslamEnabled then return end
                 local n = c:GetAttribute("CurrentM1")
                 if n == 4 then
+                    -- MOBILE ONLY. PC already pops off the ground naturally by the finisher, so PC
+                    -- keeps its existing (working) downslam completely untouched -- we ONLY force
+                    -- the hop on mobile. This is what you asked for: don't touch the PC downslam.
                     local hum = c:FindFirstChildOfClass("Humanoid")
-                    if hum and not dsAirborne(hum) then
+                    if mobile and hum and not dsAirborne(hum) then
                         dsLiftOff(c, hum)
+                        -- KEEP us airborne for a short window. The finisher remote fires a fraction
+                        -- of a second AFTER CurrentM1 hits 4, and a single velocity pulse can already
+                        -- be decaying (or we've landed) by then -- so the server saw us grounded and
+                        -- gave a NORMAL hit ("sometimes downslams, sometimes doesn't"). Re-assert
+                        -- upward velocity until the finisher lands so we're DEFINITELY airborne.
+                        task.spawn(function()
+                            local hrp = c.PrimaryPart or c:FindFirstChild("HumanoidRootPart")
+                            if not hrp then return end
+                            local t0 = os.clock()
+                            while os.clock() - t0 < 0.35 do
+                                if not dsAirborne(hum) then
+                                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                                    local v = hrp.AssemblyLinearVelocity
+                                    if v.Y < 10 then hrp.AssemblyLinearVelocity = Vector3.new(v.X, 30, v.Z) end
+                                end
+                                RunService.Heartbeat:Wait()
+                            end
+                        end)
                     end
                 end
             end)
@@ -1319,7 +1391,8 @@ do
                 -- when you went slowly). Converting your real finisher in place keeps the combo in
                 -- sync with the server, so it downslams every time. The CurrentM1==4 pre-hop above
                 -- already lifts you a beat earlier so you're usually airborne before this even runs.
-                if hum and not dsAirborne(hum) then
+                if mobile and hum and not dsAirborne(hum) then
+                    -- MOBILE ONLY hop (see above) -- PC is left to its natural airborne finisher.
                     dsLiftOff(ch, hum)
                 end
                 return oldDS(self, "Down")
