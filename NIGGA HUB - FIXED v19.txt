@@ -238,6 +238,25 @@ local function reassertControls()
     if not mobile then return end
     for _, d in ipairs({0, 0.03, 0.08, 0.16, 0.3}) do task.delay(d, restoreTouchControls) end
 end
+-- HARD rebuild: a plain pm:Enable() (in restoreTouchControls) often is NOT enough after a
+-- synthetic KEY event leaves the control module in keyboard mode -- it keeps the (now hidden)
+-- old thumbstick, so on Delta the joystick stays gone after a flash. Disable() then Enable()
+-- forces the module to tear DOWN and rebuild the DynamicThumbstick from scratch -- the standard
+-- way to get a stuck-off mobile joystick back. We run this ONCE after the flash chain settles.
+local function rebuildTouchControls()
+    if not mobile then return end
+    pcall(function()
+        local mod = require(LocalPlayer.PlayerScripts:WaitForChild("PlayerModule", 2))
+        local pm = mod and mod:GetControls()
+        if pm then
+            PlayerModuleControls = pm
+            pcall(function() pm:Disable() end)
+            task.wait(0.05)
+            pcall(function() pm:Enable() end)
+        end
+    end)
+    restoreTouchControls()
+end
 if mobile then
     -- whenever the engine switches away from touch (caused by our synthetic input), restore.
     -- MUST use the LastInputTypeChanged EVENT, never GetPropertyChangedSignal("LastInputType"):
@@ -1229,15 +1248,16 @@ do
         pcall(function() c:GetAttributeChangedSignal("Moveset"):Connect(resolveDS) end)
         -- RESTORED (with a gentle hop): the server only accepts a "Down" finisher while AIRBORNE,
         -- and on mobile the combo does NOT pop you off the ground. So we watch the combo counter
-        -- and do a SLIGHT hop right after the 3rd M1 -- then when YOU tap the 4th M1 the finisher
-        -- fires in the air and the hook below turns it into a downslam. This is the v35 approach
+        -- and do a SLIGHT hop once you've thrown the 3rd M1 (CurrentM1 == 4, i.e. as the 4th M1
+        -- begins). v39 hopped at == 3 which jumped a beat too EARLY (right after only the 2nd M1).
+        -- When your 4th M1 then lands you're airborne and the hook below turns it into a downslam. This is the v35 approach
         -- that actually WORKED; removing it (v36) broke downslam because the in-air swallow/re-fire
         -- can't reliably leave the ground. dsLiftOff is now a small hop so it isn't too high.
         pcall(function()
             c:GetAttributeChangedSignal("CurrentM1"):Connect(function()
                 if not St.autoDownslamEnabled then return end
                 local n = c:GetAttribute("CurrentM1")
-                if n == 3 then
+                if n == 4 then
                     local hum = c:FindFirstChildOfClass("Humanoid")
                     if hum and not dsAirborne(hum) then
                         dsLiftOff(c, hum)
@@ -2552,7 +2572,9 @@ local function bfFireCharged(effTime, target, skipOrient)
         if bfTouchGuard then
             task.delay(0.4, function()
                 if bfTouchGuard then bfTouchGuard:Disconnect(); bfTouchGuard = nil end
-                if mobile then reassertControls() end
+                -- hard rebuild of the thumbstick (Disable/Enable) THEN the multi-frame re-assert,
+                -- so the joystick comes back even when a plain Enable() didn't bring it back.
+                if mobile then rebuildTouchControls(); reassertControls() end
             end)
         end
         -- restore AutoRotate (the no-shift-lock fallback may have disabled it)
@@ -2778,28 +2800,11 @@ end
         if not target then return false end
         if isDashing or bfActive then return false end
         if isKnockedBack(target) then return false end
-        -- The BF chain keeps a Heartbeat tracker running continuously, so its curved dash always
-        -- has warm velocity/yaw prediction (buttery smooth). Block-break used to call updateTracker
-        -- ONCE then dash with COLD prediction -- that single stale sample is exactly why the block-
-        -- break dash felt choppy next to the BF dash. Keep a live tracker running for the whole
-        -- block-break dash so it predicts the target's motion just like the BF chain does.
+        -- REVERTED to the pre-v37 (v36) block-break dash at your request: one tracker sample then
+        -- a straight curved dash, NO continuous bbTracker. You said the older one was better, so this
+        -- is left as-is.
         updateTracker(target)
-        local bbTracker = RunService.Heartbeat:Connect(function()
-            if not isDashing then return end
-            updateTracker(target)
-        end)
-        local ok = executeCurvedDash(target, { noBF = true, onArrive = onArrive })
-        if ok then
-            task.spawn(function()
-                local t0 = os.clock()
-                repeat RunService.Heartbeat:Wait() until isDashing or (os.clock() - t0) > 0.25
-                repeat RunService.Heartbeat:Wait() until not isDashing
-                if bbTracker then bbTracker:Disconnect(); bbTracker = nil end
-            end)
-        else
-            if bbTracker then bbTracker:Disconnect(); bbTracker = nil end
-        end
-        return ok
+        return executeCurvedDash(target, { noBF = true, onArrive = onArrive })
     end
 
     _G.bfStartAll = bfStartAll
