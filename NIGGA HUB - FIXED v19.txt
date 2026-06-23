@@ -651,6 +651,22 @@ local function setupInvisForChar(char)
         track.TimePosition=Cfg.INVIS_FREEZE_TIME
         track:AdjustSpeed(0)
     end)
+    -- CLIENT-ONLY self view: a faint highlight so YOU can still see your own body / facing while
+    -- everyone else sees nothing. It's created locally on your client, so it never replicates to
+    -- other players -- you stay fully invisible to them. Highlights render over parts even when
+    -- those parts are fully transparent, so this works no matter how the invis hides you.
+    pcall(function()
+        local old = char:FindFirstChild("NH_SelfView"); if old then old:Destroy() end
+        local hl = Instance.new("Highlight")
+        hl.Name = "NH_SelfView"
+        hl.Adornee = char
+        hl.FillColor = Color3.fromRGB(190, 210, 255)
+        hl.FillTransparency = 0.6
+        hl.OutlineColor = Color3.fromRGB(120, 170, 255)
+        hl.OutlineTransparency = 0.1
+        hl.DepthMode = Enum.HighlightDepthMode.Occluded
+        hl.Parent = char
+    end)
 end
 
 local function cleanupInvis(char)
@@ -662,6 +678,10 @@ local function cleanupInvis(char)
         end)
         St.invisAnimTrack=nil
     end
+    pcall(function()
+        local hl = char and char:FindFirstChild("NH_SelfView")
+        if hl then hl:Destroy() end
+    end)
     if not char then return end
     local animateScript=char:FindFirstChild("Animate")
     if animateScript then
@@ -824,6 +844,32 @@ local function getBestFrontTarget(myHRP)
                     -- prefer most-in-front, then closest
                     local score = facing - (dist / maxWorldDist) * 0.5
                     if score > bestScore then bestScore = score; best = t end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- MOBILE aim-lock helper: pick the enemy nearest the CENTER of your screen (i.e. whoever your
+-- camera is pointing at), within lock range and actually on-screen. This lets a single button
+-- press lock "whoever I'm aiming at" with ZERO reliance on tapping the screen, so dragging or
+-- rotating the camera can never lock onto a random player.
+local function getTargetNearestScreenCenter(myHRP)
+    if not myHRP then return nil end
+    local vp = Camera.ViewportSize
+    local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+    local maxPix = math.min(vp.X, vp.Y) * 0.30   -- must be roughly centred (within ~30% of the smaller screen dimension)
+    local maxWorldDist = Cfg.LockOn.MaxDistance
+    local best, bestPix = nil, maxPix
+    for _, t in ipairs(getValidTargets(myHRP)) do
+        if t.Core and t.Humanoid and t.Humanoid.Health > 0 then
+            local wd = (t.Core.Position - myHRP.Position).Magnitude
+            if wd <= maxWorldDist then
+                local sp, onScreen = Camera:WorldToViewportPoint(t.Core.Position)
+                if onScreen and sp.Z > 0 then
+                    local pix = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                    if pix < bestPix then bestPix = pix; best = t end
                 end
             end
         end
@@ -2663,8 +2709,36 @@ local function bfFireCharged(effTime, target, skipOrient)
         task.delay(BF.SPAM_COOLDOWN or 0.12, function() bfBusy = false end)
     end)
 end
+-- SELF-STATE GUARD: never start a black flash while YOU are not in a clean, actionable state.
+-- If you're grabbed / held / stunned / ragdolled / being flung, firing the chain used to drag
+-- your victim around with you (or fling you both in a random direction). Now it's simply dropped
+-- so the flash only ever runs when you can actually act -- smooth, no bugs.
+local function bfSelfBlocked()
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not ch or not hum or not hrp or hum.Health <= 0 then return true end
+    -- game ragdoll attribute (0 = fine, anything else = ragdolled / grabbed)
+    if (ch:GetAttribute("Ragdoll") or 0) ~= 0 then return true end
+    -- the game's CC / grab markers live as child instances on your character
+    if ch:FindFirstChild("Stun") or ch:FindFirstChild("Knockback") or ch:FindFirstChild("Hold")
+        or ch:FindFirstChild("Grab") or ch:FindFirstChild("Grabbed") or ch:FindFirstChild("Carry") then
+        return true
+    end
+    -- physics ragdoll / fall states
+    local st = hum:GetState()
+    if st == Enum.HumanoidStateType.Ragdoll or st == Enum.HumanoidStateType.FallingDown
+        or st == Enum.HumanoidStateType.PlatformStanding then return true end
+    -- being physically launched / flung upward (a normal dash is horizontal, so we only gate on a
+    -- large VERTICAL velocity to avoid blocking the legit post-dash flash)
+    local v = hrp.AssemblyLinearVelocity
+    if math.abs(v.Y) > 80 then return true end
+    return false
+end
+
 local function startBlackFlash(target)
     if bfActive or bfBusy then return end
+    if bfSelfBlocked() then return end
     bfBusy = true  -- claim the WHOLE sequence up-front, BEFORE chainCorrectionDash yields, so rapid re-taps are dropped instead of spawning overlapping flashes
     if target and CHAIN_CORRECT_ENABLED and not alreadyAtBack(target) then
         local _, predBack = predictBack(target, PREDICT_LEAD)
@@ -2822,6 +2896,7 @@ end
     local function bfTriggerDash_inner()
         if not St.bfEnabled then return end
         if isDashing or bfActive or bfBusy then return end
+        if bfSelfBlocked() then return end
         local target, dist = findTarget()
         if not target then return end
         if isKnockedBack(target) then return end
@@ -2878,6 +2953,7 @@ end
     _G.NH_dashBehind = function(target, onArrive)
         if not target then return false end
         if isDashing or bfActive or bfBusy then return false end
+        if bfSelfBlocked() then return false end
         if isKnockedBack(target) then return false end
         -- REVERTED to the pre-v37 (v36) block-break dash at your request: one tracker sample then
         -- a straight curved dash, NO continuous bbTracker. You said the older one was better, so this
@@ -3027,7 +3103,7 @@ end})
 Tabs.Combat:AddButton({Title="Stop Spectating", Callback=function() ovStopSpectate() notify("Spectating", "Stopped.", 2) end})
 
 local LockOnSection = Tabs.Combat:AddSection("Lock-On System")
-Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, tap the LOCK ON button to start targeting, then tap an enemy to lock. Tap them again to unlock, or tap another to switch. Tap LOCK ON again to stop targeting."})
+Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, aim your camera so the enemy is near the middle of your screen, then press the LOCK ON button to lock onto them. Aim at someone else and press again to switch, or press while aiming at your current target (or at empty space) to unlock. Screen taps no longer lock, so moving your camera around won't grab random players."})
 
 Tabs.Combat:AddToggle("TglLockOn", {
     Title="Lock-On Enable (Mobile)", 
@@ -3485,40 +3561,45 @@ if mobile then
     end, false)
 
     local lockGui = createFloatButton("LockBtn", "LOCK ON", vp.X-80, vp.Y-240, Color3.fromRGB(30,80,220), Color3.fromRGB(80,200,255), function()
-        -- MOBILE LOCK-ON (simple + deterministic, no more random lock/unlock):
-        --   * Press once   -> instantly locks the enemy you are FACING (within range).
-        --   * While locked  -> TAP any enemy to switch the lock straight onto them.
-        --   * Press again   -> fully unlocks and frees your camera / character.
-        -- It NEVER locks or unlocks on its own; only your button press or a tap ON an
-        -- enemy changes it.
+        -- MOBILE LOCK-ON (aim + press, 100% drag-proof):
+        --   * Point your CAMERA at an enemy (put them near the middle of your screen).
+        --   * Press LOCK ON -> locks whoever is nearest your screen centre.
+        --   * Aim at a different enemy + press -> switches the lock onto them.
+        --   * Press again while aiming at your CURRENT target (or at empty sky) -> unlocks.
+        -- Raw screen taps NEVER lock anymore, so dragging the camera can't grab a random player.
         if not St.lockOnEnabled then notify("Lock-On", "Enable Lock-On in the menu first.", 2); return false end
+        local mc = LocalPlayer.Character
+        local myHRP = mc and mc:FindFirstChild("HumanoidRootPart")
+        local aim = getTargetNearestScreenCenter(myHRP)
+        if aim then
+            if St.lockOnTarget and St.lockOnTarget.Char and St.lockOnTarget.Char == aim.Char then
+                -- aiming at the one you're already locked to -> release
+                St.lockOnTarget = nil
+                St.lockOnArmed = false
+                RunService:UnbindFromRenderStep("HubLockOnSystem")
+                local h = mc and mc:FindFirstChildOfClass("Humanoid"); if h then h.AutoRotate = true end
+                clearLockOnESP()
+                notify("Lock-On", "Unlocked.", 2)
+                return false
+            end
+            St.lockOnTarget = aim
+            St.lockOnArmed = false
+            enableLockOn()
+            notify("Lock-On", "Locked onto " .. aim.name .. ". Aim + press to switch.", 2)
+            return true
+        end
+        -- nothing under your aim near the centre of the screen
         if St.lockOnTarget then
-            -- already locked -> release
             St.lockOnTarget = nil
             St.lockOnArmed = false
             RunService:UnbindFromRenderStep("HubLockOnSystem")
-            local mc = LocalPlayer.Character
-            local h = mc and mc:FindFirstChildOfClass("Humanoid")
-            if h then h.AutoRotate = true end
+            local h = mc and mc:FindFirstChildOfClass("Humanoid"); if h then h.AutoRotate = true end
             clearLockOnESP()
             notify("Lock-On", "Unlocked.", 2)
             return false
         end
-        -- not locked -> lock whoever is in front of you
-        local mc = LocalPlayer.Character
-        local myHRP = mc and mc:FindFirstChild("HumanoidRootPart")
-        local best = getBestFrontTarget(myHRP)
-        if best then
-            St.lockOnTarget = best
-            St.lockOnArmed = true
-            enableLockOn()
-            notify("Lock-On", "Locked onto " .. best.name .. ". Tap another enemy to switch.", 2)
-            return true
-        end
-        -- nobody in front -> arm so a direct tap on an enemy still locks
-        St.lockOnArmed = true
-        notify("Lock-On", "No one in front - tap an enemy to lock onto them.", 2)
-        return true
+        notify("Lock-On", "Aim at an enemy (centre of screen) and press LOCK ON.", 2)
+        return false
     end, false)
 
     local sweepGui = createFloatButton("SweepBtn", "SWEEP", vp.X-160, vp.Y-240, Color3.fromRGB(40,160,90), Color3.fromRGB(90,255,150), function()
@@ -3793,24 +3874,10 @@ UserInputService.InputBegan:Connect(function(inp, gp)
         local isPCKeybind = (not mobile and inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode == Keys.lockOnKey)
 
         if isMobileTouch then
-            -- MOBILE: press the on-screen "LOCK ON" button once to enter targeting mode.
-            -- While in targeting mode your taps control the lock:
-            --   * tap an enemy          -> lock onto them
-            --   * tap a different enemy -> switch the lock to them
-            --   * tap the locked enemy  -> release the lock
-            -- Press LOCK ON again to leave targeting mode so normal taps are free.
-            if St.lockOnArmed then
-                local clickedTarget = getTargetFromScreen(Vector2.new(inp.Position.X, inp.Position.Y))
-                -- MOBILE: a tap that lands ON an enemy locks/switches onto them. Tapping
-                -- empty space, or your already-locked target, does NOTHING (no accidental
-                -- unlock) -- use the LOCK ON button to unlock. This removes the old
-                -- "locks/unlocks at random as I tap around" behavior.
-                if clickedTarget and not (St.lockOnTarget and St.lockOnTarget.Char and St.lockOnTarget.Char == clickedTarget.Char) then
-                    St.lockOnTarget = clickedTarget
-                    enableLockOn()
-                    notify("Lock-On", "Locked onto " .. clickedTarget.name .. ".", 2)
-                end
-            end
+            -- MOBILE: locking is handled ENTIRELY by the on-screen LOCK ON button (aim your
+            -- camera at an enemy + press). Raw screen taps deliberately do NOTHING here, so
+            -- dragging / rotating the camera can never lock onto a random player. This is the
+            -- fix for the old "tap anywhere and it locks onto someone" behaviour.
         elseif isPCKeybind then
             -- PC: press the lock-on keybind while hovering an enemy to lock.
             --   * press it on a different enemy -> switch the lock to them
