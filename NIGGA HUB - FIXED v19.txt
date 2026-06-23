@@ -766,23 +766,40 @@ end
 -- here silently overrode the tap radius, so it has been removed.
 
 -- == Lock-On ESP: highlight the locked target so you can see it through walls ==
-local function clearLockOnESP()
+-- Hand the camera back to the player. We take it Scriptable while steering a lock-on, so on every
+-- unlock / lost-target path the camera must be restored to the player's previous mode (usually
+-- Custom) or their view would stay frozen. Centralised because every real teardown calls clearLockOnESP().
+local function restoreLockOnCamera()
+    local cam = Workspace.CurrentCamera
+    if cam and cam.CameraType == Enum.CameraType.Scriptable then
+        cam.CameraType = St.lockCamPrevType or Enum.CameraType.Custom
+    end
+    St.lockCamPrevType = nil
+end
+-- Destroy ONLY the ESP highlight. Used by the per-frame ESP refresh so toggling ESP off mid-lock
+-- never touches (and never fights) the lock-on camera.
+local function clearLockOnHighlight()
     if St.lockOnHighlight then
         pcall(function() St.lockOnHighlight:Destroy() end)
         St.lockOnHighlight = nil
     end
 end
+-- Full teardown: drop the ESP highlight AND give the camera back to the player.
+local function clearLockOnESP()
+    clearLockOnHighlight()
+    restoreLockOnCamera()
+end
 local function updateLockOnESP()
     -- only show ESP while ESP is on AND we actually have a live locked target
     if not Cfg.LockOn.ESP or not St.lockOnEnabled or not St.lockOnTarget
         or not St.lockOnTarget.Char or not St.lockOnTarget.Char.Parent then
-        clearLockOnESP()
+        clearLockOnHighlight()
         return
     end
     local char = St.lockOnTarget.Char
     -- already highlighting this exact character -> nothing to do
     if St.lockOnHighlight and St.lockOnHighlight.Adornee == char then return end
-    clearLockOnESP()
+    clearLockOnHighlight()
     local hl = Instance.new("Highlight")
     hl.Name = "NH_LockOnESP"
     hl.Adornee = char
@@ -831,14 +848,11 @@ local function enableLockOn()
         local alpha = firstFrame and 1 or math.clamp(1 - (1 - base) ^ (math.max(dt or 0, 0) * 60), 0, 1)
         firstFrame = false
 
-        if Cfg.LockOn.Method == "Camera" then
-            myHum.AutoRotate = true
-            local cam = Workspace.CurrentCamera
-            local currentPos = cam.CFrame.Position
-            local targetLook = targetCore.Position + (targetCore.CFrame.RightVector * Cfg.LockOn.SideOffset)
-            local goalCF = CFrame.lookAt(currentPos, targetLook)
-            cam.CFrame = CFrame.new(currentPos) * cam.CFrame.Rotation:Lerp(goalCF.Rotation, alpha)
-        else
+        -- Drive the CAMERA this frame for the "Camera" method, and ALSO during invisibility (where
+        -- you're frozen mid-animation and can't see/aim your own body).
+        local steerCam = (Cfg.LockOn.Method == "Camera") or St.invisActive
+
+        if Cfg.LockOn.Method ~= "Camera" then
             -- Body method: rotate your HRP to face the target (runs during invis too -- the glitch
             -- only displaces your rendered rig, not the HRP, so this makes you genuinely face the
             -- enemy and your hits land).
@@ -846,18 +860,49 @@ local function enableLockOn()
             local targetPos = Vector3.new(targetCore.Position.X, myHRP.Position.Y, targetCore.Position.Z)
             local goalCF = CFrame.lookAt(myHRP.Position, targetPos)
             myHRP.CFrame = CFrame.new(myHRP.Position) * myHRP.CFrame.Rotation:Lerp(goalCF.Rotation, alpha)
-            -- INVIS FIX: while invisible you're frozen mid-animation and can't see your own body, so
-            -- rotating the HRP gives you no visible feedback. During invis we ALSO swing the CAMERA to
-            -- look at the target -- so lock-on now visibly turns your view onto the enemy and tracks
-            -- them, exactly as expected, even though your character is frozen / out of sight.
-            if St.invisActive then
-                local cam = Workspace.CurrentCamera
-                if cam then
-                    local currentPos = cam.CFrame.Position
-                    local goalCamCF = CFrame.lookAt(currentPos, targetCore.Position + (targetCore.CFrame.RightVector * Cfg.LockOn.SideOffset))
-                    cam.CFrame = CFrame.new(currentPos) * cam.CFrame.Rotation:Lerp(goalCamCF.Rotation, alpha)
+        else
+            myHum.AutoRotate = true
+        end
+
+        if steerCam then
+            -- SMOOTH LOCK-ON CAMERA.
+            -- Before, we left the camera in Roblox's default Custom mode and just overwrote its
+            -- rotation every frame toward the target. The built-in camera controller kept
+            -- re-asserting its OWN orientation from your look/drag input, so the two writes fought
+            -- each other -- that tug-of-war is the jitter/"fighting" you saw, and it was worst when
+            -- the target was off to the side or behind you (big angle gap = big fight).
+            -- Fix: take real ownership with a Scriptable orbit camera. Nothing else writes the camera,
+            -- so there's zero conflict -- just a clean, smooth follow that orbits to your far side from
+            -- the enemy (framing you both) and eases onto a target that's currently out of view.
+            local cam = Workspace.CurrentCamera
+            if cam then
+                if cam.CameraType ~= Enum.CameraType.Scriptable then
+                    -- remember the player's mode + current zoom so we can restore their framing on unlock
+                    St.lockCamPrevType = cam.CameraType
+                    St.lockCamDist = math.clamp((cam.CFrame.Position - myHRP.Position).Magnitude, 8, 22)
+                    cam.CameraType = Enum.CameraType.Scriptable
                 end
+                local dist = St.lockCamDist or 12
+                local subjectPos = myHRP.Position + Vector3.new(0, 1.5, 0)
+                local tPos = targetCore.Position
+                -- horizontal dir from the target back to you; camera sits on your far side so you're
+                -- between it and the enemy (classic lock-on framing). Guard the degenerate overlap case.
+                local flat = subjectPos - tPos
+                flat = Vector3.new(flat.X, 0, flat.Z)
+                flat = (flat.Magnitude > 0.1) and flat.Unit or myHRP.CFrame.LookVector
+                local sideOff = targetCore.CFrame.RightVector * Cfg.LockOn.SideOffset
+                local camPos = subjectPos + flat * dist + Vector3.new(0, 2.5, 0)
+                local lookPoint = subjectPos:Lerp(tPos + sideOff, 0.5)  -- keep both you and the enemy framed
+                local goalCamCF = CFrame.lookAt(camPos, lookPoint)
+                -- Ease in smoothly (frame-rate independent) WITHOUT the first-frame snap, so a target
+                -- behind you glides into view instead of whipping the camera around.
+                local camAlpha = math.clamp(1 - (1 - base) ^ (math.max(dt or 0, 0) * 60), 0, 1)
+                cam.CFrame = cam.CFrame:Lerp(goalCamCF, camAlpha)
             end
+        else
+            -- not steering the camera (e.g. Body method while NOT invisible) -> make sure the player
+            -- has their normal free-look camera back if we'd taken it on a previous frame.
+            restoreLockOnCamera()
         end
     end)
 end
