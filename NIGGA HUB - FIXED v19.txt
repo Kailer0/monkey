@@ -3179,21 +3179,6 @@ Tabs.Combat:AddButton({Title="Hunt for Cycle", Callback=runHunt})
 Tabs.Combat:AddButton({Title="Force Reset", Callback=forceReset})
 Tabs.Combat:AddButton({Title="Check AC Status", Callback=checkACStatus})
 
-Tabs.Combat:AddSection("Spectate Target")
-Tabs.Combat:AddDropdown("DpSpectate", {Title="Select Player", Values={"(press Refresh)"}, Default=1, Callback=function(v) _G.spectateTargetName = v end})
-Tabs.Combat:AddButton({Title="Refresh Players", Callback=function()
-    local names = {}
-    for _,p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(names, p.Name) end end
-    if #names == 0 then names = {"(none)"} end
-    Fluent.Options.DpSpectate:SetValues(names)
-end})
-Tabs.Combat:AddButton({Title="Spectate", Callback=function()
-    if _G.spectateTargetName and _G.spectateTargetName ~= "(none)" and _G.spectateTargetName ~= "(press Refresh)" then
-        if ovStartSpectate(_G.spectateTargetName) then notify("Spectating", _G.spectateTargetName, 2) end
-    end
-end})
-Tabs.Combat:AddButton({Title="Stop Spectating", Callback=function() ovStopSpectate() notify("Spectating", "Stopped.", 2) end})
-
 local LockOnSection = Tabs.Combat:AddSection("Lock-On System")
 Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, aim your camera so the enemy is near the middle of your screen, then press the LOCK ON button to lock onto them. Aim at someone else and press again to switch, or press while aiming at your current target (or at empty space) to unlock. Screen taps no longer lock, so moving your camera around won't grab random players."})
 
@@ -3293,6 +3278,21 @@ end})
 
 Tabs.Targets:AddButton({Title="Detach", Callback=stopAttach})
 
+Tabs.Targets:AddSection("Spectate Target")
+Tabs.Targets:AddDropdown("DpSpectate", {Title="Select Player", Values={"(press Refresh)"}, Default=1, Callback=function(v) _G.spectateTargetName = v end})
+Tabs.Targets:AddButton({Title="Refresh Players", Callback=function()
+    local names = {}
+    for _,p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(names, p.Name) end end
+    if #names == 0 then names = {"(none)"} end
+    Fluent.Options.DpSpectate:SetValues(names)
+end})
+Tabs.Targets:AddButton({Title="Spectate", Callback=function()
+    if _G.spectateTargetName and _G.spectateTargetName ~= "(none)" and _G.spectateTargetName ~= "(press Refresh)" then
+        if ovStartSpectate(_G.spectateTargetName) then notify("Spectating", _G.spectateTargetName, 2) end
+    end
+end})
+Tabs.Targets:AddButton({Title="Stop Spectating", Callback=function() ovStopSpectate() notify("Spectating", "Stopped.", 2) end})
+
 
 -- [MOVEMENT & BF]
 Tabs.Movement:AddToggle("TglFly", {Title="Enable Fly", Default=false, Callback=function(v) 
@@ -3330,6 +3330,31 @@ Tabs.Movement:AddToggle("TglBFChain", {Title="Chain Reposition", Default=true, C
 -- [CHARACTERS]
 Tabs.Characters:AddToggle("TglTodoClap", {Title="Todo Perfect Clap", Default=false, Callback=function(v) St.todoEnabled = v if v then notify("Todo", "Perfect Clap enabled.", 2) end end})
 Tabs.Characters:AddButton({Title="Instant Blackhole (Yuki)", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/InstantBlackHole.JJS"))() end) end})
+Tabs.Characters:AddToggle("TglNanami", {
+    Title="Auto Nanami Ratio", 
+    Default=false, 
+    Callback=function(v) 
+        if v then startNanami() else stopNanami() end
+    end
+})
+
+Tabs.Characters:AddSection("Auto QTE")
+Tabs.Characters:AddToggle("TglAutoQTE", {
+    Title="Auto QTE (Hiromi & Beam Clash)", 
+    Default=false, 
+    Callback=function(v) 
+        St.autoQteEnabled = v
+        if v then startAutoQTE() else stopAutoQTE() end
+    end
+})
+Tabs.Characters:AddSlider("SldQTESpeed", {
+    Title="QTE Speed (Clicks per sec)", 
+    Min=1, 
+    Max=50, 
+    Default=15, 
+    Rounding=0, 
+    Callback=function(v) St.qteSpeed = v end
+})
 
 Tabs.Characters:AddSection("Yuta Kokusen Automation")
 local yutaTargetList = {}
@@ -3353,31 +3378,6 @@ Tabs.Characters:AddButton({Title="Stop Auto Yuta Loop", Callback=function() stop
 
 Tabs.Characters:AddButton({Title="Yuta BF Oneshot Script", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Lazzexaa/gugugaga/refs/heads/main/yutabf.txt"))() end) end})
 Tabs.Characters:AddButton({Title="Higuruma Vote Viewer", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/HigarumaVoteView.JJS"))() end) end})
-
-Tabs.Characters:AddSection("QTE & Auto Actions")
-Tabs.Characters:AddToggle("TglNanami", {
-    Title="Auto Nanami Ratio", 
-    Default=false, 
-    Callback=function(v) 
-        if v then startNanami() else stopNanami() end
-    end
-})
-Tabs.Characters:AddToggle("TglAutoQTE", {
-    Title="Auto QTE (Hiromi & Beam Clash)", 
-    Default=false, 
-    Callback=function(v) 
-        St.autoQteEnabled = v
-        if v then startAutoQTE() else stopAutoQTE() end
-    end
-})
-Tabs.Characters:AddSlider("SldQTESpeed", {
-    Title="QTE Speed (Clicks per sec)", 
-    Min=1, 
-    Max=50, 
-    Default=15, 
-    Rounding=0, 
-    Callback=function(v) St.qteSpeed = v end
-})
 
 -- [EXTRAS]
 Tabs.Extras:AddButton({Title="Hitbox Extender", Callback=function()
@@ -3466,7 +3466,6 @@ else
     -- (Removed the mobile "Show Fly Button" and "Show BF Button" quick-access toggles:
     --  Fly and Black Flash already have dedicated float buttons that appear automatically
     --  when their feature is enabled, so these were redundant.)
-    mbBtn("MbLock", "Show Lock-On Button", "LockBtn")
     mbBtn("MbYonk", "Show Yonk Button", "YonkBtn")
     mbBtn("MbEmote", "Show Emote Button", "EmoteBtn")
 end
