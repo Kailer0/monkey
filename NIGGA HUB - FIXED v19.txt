@@ -651,21 +651,54 @@ local function setupInvisForChar(char)
         track.TimePosition=Cfg.INVIS_FREEZE_TIME
         track:AdjustSpeed(0)
     end)
-    -- CLIENT-ONLY self view: a faint highlight so YOU can still see your own body / facing while
-    -- everyone else sees nothing. It's created locally on your client, so it never replicates to
-    -- other players -- you stay fully invisible to them. Highlights render over parts even when
-    -- those parts are fully transparent, so this works no matter how the invis hides you.
+    -- CLIENT-ONLY SELF-VIEW (v55): this invis glitch freezes you mid-animation and can drag your rig
+    -- (and sometimes the HRP) somewhere you can't see -- often UNDER the map -- so a plain part marker
+    -- ends up hidden right along with you. The fix: build our own little marker rig and put a Highlight
+    -- on it with DepthMode = AlwaysOnTop. An AlwaysOnTop highlight renders THROUGH the map, so you see
+    -- your glowing silhouette + a forward arrow no matter where the glitch parked you. It's parented to
+    -- the camera (client-only, never replicates, game scripts won't clean it up), so you're still 100%
+    -- invisible to everyone else.
     pcall(function()
-        local old = char:FindFirstChild("NH_SelfView"); if old then old:Destroy() end
-        local hl = Instance.new("Highlight")
-        hl.Name = "NH_SelfView"
-        hl.Adornee = char
-        hl.FillColor = Color3.fromRGB(190, 210, 255)
-        hl.FillTransparency = 0.6
-        hl.OutlineColor = Color3.fromRGB(120, 170, 255)
-        hl.OutlineTransparency = 0.1
-        hl.DepthMode = Enum.HighlightDepthMode.Occluded
-        hl.Parent = char
+        if St.selfViewModel then St.selfViewModel:Destroy(); St.selfViewModel = nil end
+        local function buildSelfView()
+            local m = Instance.new("Model"); m.Name = "NH_SelfViewMarker"
+            local body = Instance.new("Part")
+            body.Name = "Body"; body.Size = Vector3.new(2, 3, 1); body.Anchored = true
+            body.CanCollide = false; body.CanQuery = false; body.CanTouch = false; body.Massless = true
+            body.Material = Enum.Material.Neon; body.Color = Color3.fromRGB(90, 170, 255); body.Transparency = 0.35
+            body.Parent = m
+            local nose = Instance.new("Part")
+            nose.Name = "Nose"; nose.Size = Vector3.new(0.45, 0.45, 2.6); nose.Anchored = true
+            nose.CanCollide = false; nose.CanQuery = false; nose.CanTouch = false; nose.Massless = true
+            nose.Material = Enum.Material.Neon; nose.Color = Color3.fromRGB(80, 255, 140); nose.Transparency = 0
+            nose.Parent = m
+            m.PrimaryPart = body
+            -- THE "highlite": AlwaysOnTop so it punches through the map even if you're under it
+            local hl = Instance.new("Highlight")
+            hl.Name = "NH_SelfHL"; hl.Adornee = m
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.FillColor = Color3.fromRGB(90, 170, 255); hl.FillTransparency = 0.4
+            hl.OutlineColor = Color3.fromRGB(80, 255, 140); hl.OutlineTransparency = 0
+            hl.Parent = m
+            m.Parent = Workspace.CurrentCamera
+            return m, body, nose
+        end
+        local m, body, nose = buildSelfView()
+        St.selfViewModel = m
+        RunService:UnbindFromRenderStep("NH_SelfView")
+        RunService:BindToRenderStep("NH_SelfView", Enum.RenderPriority.Camera.Value + 2, function()
+            if not St.invisActive then return end
+            -- self-heal if the model got destroyed (respawn / executor GC / etc.)
+            if not m or not m.Parent then
+                m, body, nose = buildSelfView()
+                St.selfViewModel = m
+            end
+            local cc = LocalPlayer.Character
+            local h = cc and cc:FindFirstChild("HumanoidRootPart")
+            if not h then return end
+            body.CFrame = h.CFrame
+            nose.CFrame = h.CFrame * CFrame.new(0, 0, -(nose.Size.Z / 2 + 0.6))  -- LookVector is -Z, arrow sits in FRONT of you
+        end)
     end)
 end
 
@@ -678,9 +711,9 @@ local function cleanupInvis(char)
         end)
         St.invisAnimTrack=nil
     end
+    pcall(function() RunService:UnbindFromRenderStep("NH_SelfView") end)
     pcall(function()
-        local hl = char and char:FindFirstChild("NH_SelfView")
-        if hl then hl:Destroy() end
+        if St.selfViewModel then St.selfViewModel:Destroy(); St.selfViewModel = nil end
     end)
     if not char then return end
     local animateScript=char:FindFirstChild("Animate")
@@ -806,11 +839,25 @@ local function enableLockOn()
             local goalCF = CFrame.lookAt(currentPos, targetLook)
             cam.CFrame = CFrame.new(currentPos) * cam.CFrame.Rotation:Lerp(goalCF.Rotation, alpha)
         else
-            if St.invisActive then return end
+            -- Body method: rotate your HRP to face the target (runs during invis too -- the glitch
+            -- only displaces your rendered rig, not the HRP, so this makes you genuinely face the
+            -- enemy and your hits land).
             myHum.AutoRotate = false
             local targetPos = Vector3.new(targetCore.Position.X, myHRP.Position.Y, targetCore.Position.Z)
             local goalCF = CFrame.lookAt(myHRP.Position, targetPos)
             myHRP.CFrame = CFrame.new(myHRP.Position) * myHRP.CFrame.Rotation:Lerp(goalCF.Rotation, alpha)
+            -- INVIS FIX: while invisible you're frozen mid-animation and can't see your own body, so
+            -- rotating the HRP gives you no visible feedback. During invis we ALSO swing the CAMERA to
+            -- look at the target -- so lock-on now visibly turns your view onto the enemy and tracks
+            -- them, exactly as expected, even though your character is frozen / out of sight.
+            if St.invisActive then
+                local cam = Workspace.CurrentCamera
+                if cam then
+                    local currentPos = cam.CFrame.Position
+                    local goalCamCF = CFrame.lookAt(currentPos, targetCore.Position + (targetCore.CFrame.RightVector * Cfg.LockOn.SideOffset))
+                    cam.CFrame = CFrame.new(currentPos) * cam.CFrame.Rotation:Lerp(goalCamCF.Rotation, alpha)
+                end
+            end
         end
     end)
 end
