@@ -3335,7 +3335,7 @@ Tabs.Movement:AddToggle("TglFly", {Title="Enable Fly", Default=false, Callback=f
 end})
 Tabs.Movement:AddSlider("SldFlySpeed", {Title="Fly Speed", Min=10, Max=650, Default=150, Rounding=0, Callback=function(v) Cfg.FlySpeed = v end})
 if mobile then
-    Tabs.Movement:AddToggle("TglFlyUpDown", {Title="Show Up / Down / Boost Buttons", Default=false, Callback=function(v) if _G.ToggleFlyControls then _G.ToggleFlyControls(v) end end})
+    Tabs.Movement:AddToggle("TglFlyUpDown", {Title="Show Up / Down Buttons", Default=false, Callback=function(v) if _G.ToggleFlyControls then _G.ToggleFlyControls(v) end end})
 end
 
 Tabs.Movement:AddSection("Dash & Wallhop Modifiers")
@@ -3852,7 +3852,12 @@ if mobile then
         fireSelectedEmote(); return false
     end, false)
 
-    for _, g in ipairs({flyGui, bfGui, lockGui, sweepGui, huntGui, yonkGui, emoteGui}) do
+    -- BOOST is a flight control but behaves like a NORMAL main button: it shows
+    -- whenever Fly is enabled (same as the Fly button) and uses the same native
+    -- transparent style. It is independent of the "Show Up / Down Buttons" toggle.
+    local boostGui = createFloatButton("FlyBoostBtn", "BOOST", vp.X-240, vp.Y-160, Color3.fromRGB(200,50,50), Color3.fromRGB(255,100,100), function(state) flyKeys.Boost = state end, true)
+
+    for _, g in ipairs({flyGui, bfGui, lockGui, sweepGui, huntGui, yonkGui, emoteGui, boostGui}) do
         table.insert(_G.mainFloatGuis, g)
     end
 
@@ -3860,6 +3865,7 @@ if mobile then
     -- _G.mainOverlayMaster (Settings > Show Main Controls) can hide everything at once.
     local featureVisible = {
         {gui = flyGui,   on = function() return St.flyToggleOn end},
+        {gui = boostGui, on = function() return St.flyToggleOn end},
         {gui = bfGui,    on = function() return St.bfEnabled end},
         {gui = lockGui,  on = function() return St.lockOnEnabled end},
         {gui = sweepGui, on = function() return St.sweepActive end},
@@ -3881,12 +3887,11 @@ if mobile then
         end
     end)
 
-    -- 2. Fly Controls Overlays (Up/Down/Boost)
+    -- 2. Fly Controls Overlays (Up/Down)
     table.insert(_G.flyFloatGuis, createFloatButton("FlyUpBtn", "UP", vp.X-80, vp.Y-320, Color3.fromRGB(30,150,150), Color3.fromRGB(80,255,255), function(state) flyKeys.Up = state end, true))
     -- moved up from vp.Y-80 (it was sitting at the very bottom edge / off-screen on
     -- phones) to sit right above the UP button in the same right-hand column.
     table.insert(_G.flyFloatGuis, createFloatButton("FlyDownBtn", "DOWN", vp.X-80, vp.Y-400, Color3.fromRGB(150,80,30), Color3.fromRGB(255,150,80), function(state) flyKeys.Down = state end, true))
-    table.insert(_G.flyFloatGuis, createFloatButton("FlyBoostBtn", "BOOST", vp.X-240, vp.Y-160, Color3.fromRGB(200,50,50), Color3.fromRGB(255,100,100), function(state) flyKeys.Boost = state end, true))
 
     _G.mainOverlayMaster = false
     _G.ToggleFlyControls(false)
