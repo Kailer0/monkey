@@ -3597,7 +3597,9 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                     clone.BackgroundTransparency = 0.35
                 end)
                 if not clone:FindFirstChildOfClass("UICorner") then
-                    Instance.new("UICorner", clone).CornerRadius = UDim.new(0.3, 0)
+                    -- Full circle (radius = 50% of the square) so text buttons match the round
+                    -- Fly / Lock-On look exactly, just with their NAME instead of an icon.
+                    Instance.new("UICorner", clone).CornerRadius = UDim.new(1, 0)
                 end
                 local lbl = Instance.new("TextLabel")
                 lbl.Name = "NHLbl"
@@ -3620,7 +3622,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
     end)
 
     if not f then
-        f = Instance.new("Frame", gui); f.Size = UDim2.fromOffset(BASE,BASE); f.Position = UDim2.fromOffset(defX, defY); f.BackgroundColor3 = Color3.fromRGB(20,20,26); f.BackgroundTransparency = 0.35; Instance.new("UICorner", f).CornerRadius=UDim.new(0.3,0)
+        f = Instance.new("Frame", gui); f.Size = UDim2.fromOffset(BASE,BASE); f.Position = UDim2.fromOffset(defX, defY); f.BackgroundColor3 = Color3.fromRGB(20,20,26); f.BackgroundTransparency = 0.35; Instance.new("UICorner", f).CornerRadius=UDim.new(1,0)
         l = Instance.new("TextLabel", f); l.Size = UDim2.new(1,-6,1,-6); l.Position = UDim2.fromScale(0.5,0.5); l.AnchorPoint = Vector2.new(0.5,0.5); l.BackgroundTransparency=1; l.Text = text; l.TextColor3 = Color3.fromRGB(255,255,255); l.Font = Enum.Font.GothamBold; l.TextScaled = true; l.TextWrapped = true
         local consF = Instance.new("UITextSizeConstraint", l); consF.MaxTextSize = 14
         b = Instance.new("TextButton", f); b.Size = UDim2.new(1,0,1,0); b.BackgroundTransparency=1; b.Text = ""
@@ -3636,8 +3638,8 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
         local sz = math.floor(BASE * _G.NH_btnScale); f.Size = UDim2.fromOffset(sz, sz)
     end
 
-    -- AUTO-ANCHOR: Fly sits above the Special button, Lock-On above the Jump button -- positioned
-    -- off the native Jump frame just like the reference data (Fly 0.5,-3.1 / Lock -0.7,-2.4). Runs
+    -- AUTO-ANCHOR: Fly sits just above the Special button, Lock-On just above the Jump button --
+    -- placed right where the reference script keeps them (low-right, by the native controls). Runs
     -- once the native controls are ready and never overrides a button you've dragged yourself.
     if anchorMode then
         task.spawn(function()
@@ -3647,22 +3649,31 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                 pcall(function()
                     local pg = LocalPlayer:FindFirstChild("PlayerGui")
                     local jmp = pg and pg:FindFirstChild("Controls") and pg.Controls:FindFirstChild("Mobile") and pg.Controls.Mobile:FindFirstChild("Jump")
-                    -- Anchor relative to the BLOCK button (the cloned template), exactly like the
-                    -- reference script's offsets (which are relative to jump.Block's own size).
-                    -- Using the much larger Jump frame here is what shoved the buttons way too high.
-                    local ref = (jmp and jmp:FindFirstChild("Block")) or jmp
-                    if ref and ref.AbsoluteSize.X > 0 then
-                        local ap, asz = ref.AbsolutePosition, ref.AbsoluteSize
-                        local x, y
-                        if anchorMode == "fly" then
-                            x = ap.X + 0.5*asz.X; y = ap.Y + (-3.1)*asz.Y
-                        else
-                            x = ap.X + (-0.7)*asz.X; y = ap.Y + (-2.4)*asz.Y
+                    -- Place FLY just ABOVE the Special button and LOCK-ON just above the Jump/Block
+                    -- button, with a small gap -- right where the reference script sits them. We no
+                    -- longer multiply by block-heights (that math shoved Fly off the top of screen).
+                    local target
+                    if anchorMode == "fly" then
+                        target = jmp and (jmp:FindFirstChild("Special") or jmp:FindFirstChild("Block"))
+                    else
+                        target = (jmp and jmp:FindFirstChild("Block")) or jmp
+                    end
+                    if target and target.AbsoluteSize.X > 0 and target.AbsolutePosition.Y > 0 then
+                        local ap, asz = target.AbsolutePosition, target.AbsoluteSize
+                        local bs = f.AbsoluteSize
+                        local bw = (bs.X > 0 and bs.X or BASE)
+                        local bh = (bs.Y > 0 and bs.Y or BASE)
+                        local gap = math.floor(bh * 0.3)
+                        -- centre horizontally on the target button, sit just above it
+                        local x = ap.X + (asz.X - bw) * 0.5
+                        local y = ap.Y - bh - gap
+                        if anchorMode ~= "fly" then
+                            -- Lock-On tucks one slot to the LEFT so it never overlaps Fly
+                            x = ap.X + (asz.X - bw) * 0.5 - (bw + gap)
                         end
                         local vpc = Camera.ViewportSize
-                        local bs = f.AbsoluteSize
-                        x = math.clamp(x, 0, math.max(0, vpc.X - (bs.X > 0 and bs.X or BASE)))
-                        y = math.clamp(y, 0, math.max(0, vpc.Y - (bs.Y > 0 and bs.Y or BASE)))
+                        x = math.clamp(x, 4, math.max(4, vpc.X - bw - 4))
+                        y = math.clamp(y, 4, math.max(4, vpc.Y - bh - 4))
                         if not userMoved then f.Position = UDim2.fromOffset(math.floor(x), math.floor(y)) end
                         done = true
                     end
@@ -3791,9 +3802,9 @@ if mobile then
     --    (from the menu/green UI dot). When the feature turns off, its button hides.
     --    EMOTE is an instant tap-to-fire button (no on/off); it shows when you enable it in Settings.
     local flyGui = createFloatButton("FlyBtn", "FLY", vp.X-80, vp.Y-160, Color3.fromRGB(30,100,30), Color3.fromRGB(80,255,80), function()
-        -- FLY starts/stops the actual flight MOTION only. It does NOT disable the
-        -- "Enable Fly" feature, so your UP / DOWN / BOOST control icons STAY on screen
-        -- after you unfly -- they only disappear when you turn OFF "Enable Fly" in the menu.
+        -- FLY starts/stops the actual flight MOTION. Your UP / DOWN / BOOST control buttons
+        -- only show while you are ACTIVELY flying (St.flyActive) -- press FLY to stop and they
+        -- hide; press FLY again to resume flying and they reappear.
         if not St.flyToggleOn then
             if Fluent.Options.TglFly then Fluent.Options.TglFly:SetValue(true) end
             return true
@@ -3881,7 +3892,7 @@ if mobile then
     -- _G.mainOverlayMaster (Settings > Show Main Controls) can hide everything at once.
     local featureVisible = {
         {gui = flyGui,   on = function() return St.flyToggleOn end},
-        {gui = boostGui, on = function() return St.flyToggleOn and _G.NH_boostVisible end},
+        {gui = boostGui, on = function() return St.flyActive and _G.NH_boostVisible end},
         {gui = bfGui,    on = function() return St.bfEnabled end},
         {gui = lockGui,  on = function() return St.lockOnEnabled end},
         {gui = sweepGui, on = function() return St.sweepActive end},
@@ -3902,7 +3913,7 @@ if mobile then
             end
         end
         -- UP / DOWN: only visible while flying AND the "Show Up / Down Buttons" toggle is on.
-        local udWant = (St.flyToggleOn and _G.NH_upDownVisible) and true or false
+        local udWant = (St.flyActive and _G.NH_upDownVisible) and true or false
         for _, g in ipairs(_G.flyFloatGuis) do
             if g and g.Parent and g.Enabled ~= udWant then g.Enabled = udWant end
         end
