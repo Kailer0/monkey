@@ -129,7 +129,7 @@ local St = {
     whitelist = {}, originalFallenHeight = Workspace.FallenPartsDestroyHeight,
     kokusenSelectedTarget = "", kokusenIsExecuting = false, autoYutaEnabled = false,
     dashMultiplierEnabled = false, dashMultiplierValue = 1, yonkEnabled = false, yonkSpeed = 1, yonkAnimTrack = nil, yonkAnim = nil,
-    autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
+    autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, autoUppercutEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
     todoEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false,
     bfLastAttackTime = {}, bfTargetLookSmoothed = {}, bfPrevTargetPos = {}, bfPrevTargetTime = {},
     StatusParagraph = nil, invisAnimTrack = nil,
@@ -1486,6 +1486,12 @@ do
     local function wantDown(dir)
         return St.autoDownslamEnabled and (dir == false or dir == nil)
     end
+    -- Auto Uppercut is the exact mirror of downslam: rewrite a NEUTRAL grounded hit
+    -- (false/nil) into "Up" -- the same value the game uses for jump uppercuts --
+    -- so every grounded M1 launches as an uppercut. Mutually exclusive with downslam.
+    local function wantUp(dir)
+        return St.autoUppercutEnabled and (dir == false or dir == nil)
+    end
 
     -- ---- PRIMARY: ToolController.UseSetService table hook (PC + mobile) ----
     local ussHooked = false
@@ -1505,7 +1511,7 @@ do
                     -- moveset remote directly (not via UseSetService) and are also guarded by
                     -- lastAutoM1, so they never false-trigger this.
                     if _G.NH_tryBlockBreak then task.spawn(_G.NH_tryBlockBreak) end
-                    if wantDown(dir) then dir = "Down" end
+                    if wantDown(dir) then dir = "Down" elseif wantUp(dir) then dir = "Up" end
                 end
                 return _G.NH_origUSS(self, name, dir, ...)
             end
@@ -1538,6 +1544,9 @@ do
                 local a = { ... }
                 if wantDown(a[1]) then
                     a[1] = "Down"
+                    return oldDS(self, unpack(a))
+                elseif wantUp(a[1]) then
+                    a[1] = "Up"
                     return oldDS(self, unpack(a))
                 end
             end
@@ -3236,7 +3245,8 @@ local Tabs = {
 
 -- [COMBAT]
 -- Auto Downslam sits at the very top of the Combat tab.
-Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, Callback=function(v) St.autoDownslamEnabled = v end})
+Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, Callback=function(v) St.autoDownslamEnabled = v; if v then St.autoUppercutEnabled = false; pcall(function() Fluent.Options.TglAutoUppercut:SetValue(false) end) end end})
+Tabs.Combat:AddToggle("TglAutoUppercut", {Title="Auto Uppercut", Default=false, Callback=function(v) St.autoUppercutEnabled = v; if v then St.autoDownslamEnabled = false; pcall(function() Fluent.Options.TglAutoDownslam:SetValue(false) end) end end})
 
 -- 0.2 Kill All: sweep / cycle-hunt / reset / AC tools all live together here.
 Tabs.Combat:AddSection("0.2 Kill All")
