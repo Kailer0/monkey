@@ -1451,8 +1451,15 @@ do
             if _G.NH_origUSS then pcall(function() tc.UseSetService = _G.NH_origUSS end) end
             _G.NH_origUSS = tc.UseSetService
             tc.UseSetService = function(self, name, dir, ...)
-                if name == "Activated" and wantDown(dir) then
-                    dir = "Down"
+                if name == "Activated" then
+                    -- Universal, moveset-agnostic genuine-M1 signal: the game routes EVERY
+                    -- moveset's M1 through ToolController:UseSetService("Activated", dir, target).
+                    -- Fire the block-break check here so it works on ANY character/mode -- not just
+                    -- the hardcoded vessel M1 animation IDs in M1_ANIMS. Our own auto-M1s fire the
+                    -- moveset remote directly (not via UseSetService) and are also guarded by
+                    -- lastAutoM1, so they never false-trigger this.
+                    if _G.NH_tryBlockBreak then task.spawn(_G.NH_tryBlockBreak) end
+                    if wantDown(dir) then dir = "Down" end
                 end
                 return _G.NH_origUSS(self, name, dir, ...)
             end
@@ -1479,6 +1486,9 @@ do
         local oldDS
         local function dsHook(self, ...)
             if self == dsRemote and getnamecallmethod() == "FireServer" then
+                -- Genuine user M1 on this moveset's Activated remote -> run the block-break check
+                -- (moveset-agnostic). lastAutoM1 inside the check ignores our own auto-M1s.
+                if _G.NH_tryBlockBreak then task.spawn(_G.NH_tryBlockBreak) end
                 local a = { ... }
                 if wantDown(a[1]) then
                     a[1] = "Down"
@@ -2066,7 +2076,14 @@ do
         if ok == false then blockBreakBusy = false end
         task.delay(0.8, function() blockBreakBusy = false end)
     end
+    -- Expose the block-break check so the UNIVERSAL M1 hook (ToolController:UseSetService
+    -- "Activated", plus the moveset-remote namecall fallback) can trigger it for ANY moveset
+    -- and ANY mode -- not just the few hardcoded vessel M1 animation IDs in M1_ANIMS.
+    _G.NH_tryBlockBreak = tryBlockBreak
 
+    -- Secondary/back-up trigger: the LOCAL player's M1 swing animation (vessel-only IDs).
+    -- Harmless duplicate for vessel (blockBreakBusy + lastBlockBreak dedupe); the universal
+    -- UseSetService hook above is what makes every other moveset work.
     -- Fire the block-break check whenever the LOCAL player starts an M1 swing.
     local function hookLocalM1(char)
         if not char then return end
@@ -3505,20 +3522,68 @@ Fluent:Notify({Title="Nigga Hub", Content="Ultimate Edition Loaded.", Duration=5
 -- ============================================================
 -- FLOAT BUTTONS & INPUT HANDLING
 -- ============================================================
-local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn)
+local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn, iconAsset)
     local gui = Instance.new("ScreenGui", LocalPlayer:WaitForChild("PlayerGui")); gui.Name = id; gui.ResetOnSpawn = false; gui.Enabled = false
     -- Render ABOVE in-game effect overlays (e.g. the Black Flash effect ScreenGui,
     -- DisplayOrder ~1000) so the mobile float buttons never get covered/"disappear"
     -- for a few seconds during/after a blackflash chain. Kept just under the green
     -- master toggle dot (99999) so that stays on top.
     gui.DisplayOrder = 99998
-    local f = Instance.new("Frame", gui); f.Size = UDim2.fromOffset(65,65); f.Position = UDim2.fromOffset(defX, defY); f.BackgroundColor3 = Color3.fromRGB(12,12,15); Instance.new("UICorner", f).CornerRadius=UDim.new(0.5,0)
-    local s = Instance.new("UIStroke", f); s.Color = c1; s.Thickness = 2.5
-    local l = Instance.new("TextLabel", f); l.Size = UDim2.new(1,0,1,0); l.BackgroundTransparency=1; l.Text = text; l.TextColor3 = c1; l.Font = Enum.Font.GothamBold; l.TextSize = 13
-    local b = Instance.new("TextButton", f); b.Size = UDim2.new(1,0,1,0); b.BackgroundTransparency=1; b.Text = ""
+
+    local f, s, l, b
+    -- NATIVE-STYLE VARIANT: when an icon asset is supplied, clone the game's OWN mobile
+    -- "Block" button so this float button matches the native control art. We clone it for
+    -- the visual only and reparent the clone into OUR managed ScreenGui (DisplayOrder 99998),
+    -- so the game's Controls.Mobile show/hide tag pass can never hide or flicker it, and we
+    -- drive it with the exact same robust drag/tap engine below. If the native button isn't
+    -- found we fall back to the built-in Frame style, so nothing ever breaks.
+    if iconAsset then
+        pcall(function()
+            local pg = LocalPlayer:FindFirstChild("PlayerGui")
+            local controls = pg and pg:FindFirstChild("Controls")
+            local mob = controls and controls:FindFirstChild("Mobile")
+            local jump = mob and mob:FindFirstChild("Jump")
+            local src = (jump and jump:FindFirstChild("Block")) or (mob and mob:FindFirstChild("Block"))
+            if src then
+                local clone = src:Clone()
+                clone.Name = "NHBtn"
+                clone.AnchorPoint = Vector2.new(0, 0)
+                clone.Size = UDim2.fromOffset(65, 65)
+                clone.Position = UDim2.fromOffset(defX, defY)
+                clone.Visible = true
+                clone.Active = true
+                pcall(function() clone.AutoButtonColor = false end)
+                clone.Parent = gui
+                local img = clone:FindFirstChild("ImageLabel")
+                if img and img:IsA("ImageLabel") then
+                    img.Image = iconAsset
+                    img.ImageColor3 = Color3.fromRGB(255, 255, 255)
+                end
+                local stroke = clone:FindFirstChildOfClass("UIStroke")
+                if not stroke then stroke = Instance.new("UIStroke", clone) end
+                stroke.Color = c1; stroke.Thickness = 2.5
+                f = clone; b = clone; s = stroke; l = nil
+            end
+        end)
+    end
+
+    if not f then
+        f = Instance.new("Frame", gui); f.Size = UDim2.fromOffset(65,65); f.Position = UDim2.fromOffset(defX, defY); f.BackgroundColor3 = Color3.fromRGB(12,12,15); Instance.new("UICorner", f).CornerRadius=UDim.new(0.5,0)
+        s = Instance.new("UIStroke", f); s.Color = c1; s.Thickness = 2.5
+        l = Instance.new("TextLabel", f); l.Size = UDim2.new(1,0,1,0); l.BackgroundTransparency=1; l.Text = text; l.TextColor3 = c1; l.Font = Enum.Font.GothamBold; l.TextSize = 13
+        b = Instance.new("TextButton", f); b.Size = UDim2.new(1,0,1,0); b.BackgroundTransparency=1; b.Text = ""
+    end
 
     f.Active = true
     b.Active = true
+
+    -- Idle/active coloring that works for BOTH the native clone (UIStroke only; the icon
+    -- keeps its natural color) and the built-in Frame+TextLabel visual.
+    local function applyColor(active)
+        local col = active and c2 or c1
+        if s then s.Color = col end
+        if l and l:IsA("TextLabel") then l.TextColor3 = col end
+    end
 
     local drag = false
     local moved = false
@@ -3538,7 +3603,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
     local function releaseHold()
         if holdActive then
             holdActive = false
-            s.Color = c1; l.TextColor3 = c1
+            applyColor(false)
             task.spawn(function() action(false) end)
         end
     end
@@ -3558,8 +3623,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                 task.spawn(function()
                     local st = action()
                     if st ~= nil then
-                        s.Color = st and c2 or c1
-                        l.TextColor3 = st and c2 or c1
+                        applyColor(st and true or false)
                     end
                 end)
             end
@@ -3584,7 +3648,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
             end)
             if isHoldBtn then
                 holdActive = true
-                s.Color = c2; l.TextColor3 = c2
+                applyColor(true)
                 task.spawn(function() action(true) end)
             end
         end
@@ -3645,7 +3709,7 @@ if mobile then
         else
             St.flyActive = true; enableFly(); return true
         end
-    end, false)
+    end, false, "rbxassetid://6684647765")
 
     local bfGui = createFloatButton("BFBtn", "BF", vp.X-160, vp.Y-160, Color3.fromRGB(160,80,255), Color3.fromRGB(255,200,50), function()
         if St.bfEnabled then bfTriggerDash() return true end return false
@@ -3691,7 +3755,7 @@ if mobile then
         end
         notify("Lock-On", "Aim at an enemy (centre of screen) and press LOCK ON.", 2)
         return false
-    end, false)
+    end, false, "rbxassetid://11738355467")
 
     local sweepGui = createFloatButton("SweepBtn", "SWEEP", vp.X-160, vp.Y-240, Color3.fromRGB(40,160,90), Color3.fromRGB(90,255,150), function()
         if Fluent.Options.TglSweep then Fluent.Options.TglSweep:SetValue(not Fluent.Options.TglSweep.Value); return Fluent.Options.TglSweep.Value end return false
