@@ -31,6 +31,8 @@ _G.NH_btnManual = {}
 
 _G.NH_floatBtns = {}
 _G.NH_btnLocked = false
+_G.NH_boostVisible = true   -- Boost button UI shows by default when flying; toggle in Flight section can hide it
+_G.NH_upDownVisible = false -- Up/Down buttons hidden by default; only show while flying AND toggled on
 _G.NH_btnScale = 1
 _G.NH_ApplyBtnScale = function(scale)
     _G.NH_btnScale = scale
@@ -3335,7 +3337,8 @@ Tabs.Movement:AddToggle("TglFly", {Title="Enable Fly", Default=false, Callback=f
 end})
 Tabs.Movement:AddSlider("SldFlySpeed", {Title="Fly Speed", Min=10, Max=650, Default=150, Rounding=0, Callback=function(v) Cfg.FlySpeed = v end})
 if mobile then
-    Tabs.Movement:AddToggle("TglFlyUpDown", {Title="Show Up / Down Buttons", Default=false, Callback=function(v) if _G.ToggleFlyControls then _G.ToggleFlyControls(v) end end})
+    Tabs.Movement:AddToggle("TglShowBoost", {Title="Show Boost Button", Default=true, Callback=function(v) _G.NH_boostVisible = v end})
+    Tabs.Movement:AddToggle("TglFlyUpDown", {Title="Show Up / Down Buttons", Default=false, Callback=function(v) _G.NH_upDownVisible = v end})
 end
 
 Tabs.Movement:AddSection("Dash & Wallhop Modifiers")
@@ -3583,10 +3586,19 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                     clone.Image = iconAsset; clone.ImageColor3 = Color3.fromRGB(255,255,255)
                 end
             else
-                -- TEXT button: hide the native icon, show the feature NAME instead
+                -- TEXT button: hide the native icon glyph, but KEEP a visible semi-transparent
+                -- rounded backing (same translucent look the icon buttons have) and show the NAME.
                 if img then img.Visible = false; img.ImageTransparency = 1 end
-                pcall(function() if clone:IsA("ImageButton") then clone.ImageTransparency = 1 end end)
+                pcall(function() clone.ImageTransparency = 1 end)
                 pcall(function() if clone:IsA("TextButton") then clone.Text = "" end end)
+                -- Force a consistent translucent button background so the text isn't just floating.
+                pcall(function()
+                    clone.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+                    clone.BackgroundTransparency = 0.35
+                end)
+                if not clone:FindFirstChildOfClass("UICorner") then
+                    Instance.new("UICorner", clone).CornerRadius = UDim.new(0.3, 0)
+                end
                 local lbl = Instance.new("TextLabel")
                 lbl.Name = "NHLbl"
                 lbl.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -3635,8 +3647,12 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                 pcall(function()
                     local pg = LocalPlayer:FindFirstChild("PlayerGui")
                     local jmp = pg and pg:FindFirstChild("Controls") and pg.Controls:FindFirstChild("Mobile") and pg.Controls.Mobile:FindFirstChild("Jump")
-                    if jmp and jmp.AbsoluteSize.X > 0 then
-                        local ap, asz = jmp.AbsolutePosition, jmp.AbsoluteSize
+                    -- Anchor relative to the BLOCK button (the cloned template), exactly like the
+                    -- reference script's offsets (which are relative to jump.Block's own size).
+                    -- Using the much larger Jump frame here is what shoved the buttons way too high.
+                    local ref = (jmp and jmp:FindFirstChild("Block")) or jmp
+                    if ref and ref.AbsoluteSize.X > 0 then
+                        local ap, asz = ref.AbsolutePosition, ref.AbsoluteSize
                         local x, y
                         if anchorMode == "fly" then
                             x = ap.X + 0.5*asz.X; y = ap.Y + (-3.1)*asz.Y
@@ -3853,8 +3869,8 @@ if mobile then
     end, false)
 
     -- BOOST is a flight control but behaves like a NORMAL main button: it shows
-    -- whenever Fly is enabled (same as the Fly button) and uses the same native
-    -- transparent style. It is independent of the "Show Up / Down Buttons" toggle.
+    -- whenever Fly is enabled (same native transparent style) and is hideable via
+    -- the "Show Boost Button" toggle. It is independent of the "Show Up / Down" toggle.
     local boostGui = createFloatButton("FlyBoostBtn", "BOOST", vp.X-240, vp.Y-160, Color3.fromRGB(200,50,50), Color3.fromRGB(255,100,100), function(state) flyKeys.Boost = state end, true)
 
     for _, g in ipairs({flyGui, bfGui, lockGui, sweepGui, huntGui, yonkGui, emoteGui, boostGui}) do
@@ -3865,7 +3881,7 @@ if mobile then
     -- _G.mainOverlayMaster (Settings > Show Main Controls) can hide everything at once.
     local featureVisible = {
         {gui = flyGui,   on = function() return St.flyToggleOn end},
-        {gui = boostGui, on = function() return St.flyToggleOn end},
+        {gui = boostGui, on = function() return St.flyToggleOn and _G.NH_boostVisible end},
         {gui = bfGui,    on = function() return St.bfEnabled end},
         {gui = lockGui,  on = function() return St.lockOnEnabled end},
         {gui = sweepGui, on = function() return St.sweepActive end},
@@ -3884,6 +3900,11 @@ if mobile then
                 local want = (e.on() or (_G.NH_btnManual and _G.NH_btnManual[e.gui.Name])) and true or false
                 if e.gui.Enabled ~= want then e.gui.Enabled = want end
             end
+        end
+        -- UP / DOWN: only visible while flying AND the "Show Up / Down Buttons" toggle is on.
+        local udWant = (St.flyToggleOn and _G.NH_upDownVisible) and true or false
+        for _, g in ipairs(_G.flyFloatGuis) do
+            if g and g.Parent and g.Enabled ~= udWant then g.Enabled = udWant end
         end
     end)
 
