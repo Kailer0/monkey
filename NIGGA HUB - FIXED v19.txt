@@ -118,7 +118,7 @@ local function getEmoteNames() local n = {} for _, e in ipairs(EMOTE_LIST) do ta
 local function setEmoteIndex(name) for i, e in ipairs(EMOTE_LIST) do if e.name == name then emoteSelectedIndex = i; return end end end
 
 local St = {
-    sweepActive = false, huntRunning = false, luckyCycleFound = false,
+    sweepActive = false, huntRunning = false, acBypassHunting = false, luckyCycleFound = false,
     noDomainTP = false, voidMethodSit = false, overlayEnabled = true,
     attachActive = false, attachTarget = nil, attachLoopId = 0, safeTpActive = false,
     bfEnabled = false, bfGlideActive = false, bfPingDelay = 0.12, bfMode = "blatant",
@@ -594,6 +594,7 @@ end
 
 local function runHunt()
     if St.huntRunning then return end
+    if St.acBypassHunting then notify("Hunt","Stop the AC-bypass reset loop first.",3); return end
     St.huntRunning = true
     notify("Hunting","Press H to stop.",3)
     local attempts=0
@@ -610,6 +611,36 @@ local function runHunt()
         else task.wait(0.5) end
     end
     St.huntRunning=false
+end
+
+local function stopHunt()
+    -- Pressing Stop Hunt while the AC-bypass reset loop is already running cancels everything.
+    if St.acBypassHunting then
+        St.acBypassHunting = false; St.huntRunning = false
+        notify("Stop Hunt","Stopped. No more resets.",3); return
+    end
+    -- Stop the lucky-cycle hunt, then KEEP force-resetting until the anti-cheat is bypassed.
+    St.huntRunning = false
+    St.acBypassHunting = true
+    task.spawn(function()
+        notify("Stop Hunt","Cycle hunt stopped. Resetting until AC is bypassed... (press Stop Hunt again to cancel)",5)
+        task.wait(0.3) -- let the cycle-hunt loop unwind first so we never double-reset
+        local attempts = 0
+        while St.acBypassHunting and attempts < Cfg.MAX_HUNT_ATTEMPTS do
+            attempts = attempts + 1
+            local ok = checkCycle()
+            if ok == true then
+                notify("AC BYPASSED","Bypass confirmed after "..attempts.." resets. You're clear.",6)
+                break
+            elseif ok == false then
+                if not St.acBypassHunting then break end
+                forceReset(); LocalPlayer.CharacterAdded:Wait(); task.wait(Cfg.RESPAWN_WAIT)
+            else
+                task.wait(0.5)
+            end
+        end
+        St.acBypassHunting = false
+    end)
 end
 
 -- ============================================================
@@ -3204,10 +3235,16 @@ local Tabs = {
 }
 
 -- [COMBAT]
-Tabs.Combat:AddToggle("TglSweep", {Title="Sweep All", Default=false, Callback=function(v) St.sweepActive = v; if v then Workspace.FallenPartsDestroyHeight = Cfg.fallenHeight runSweep() else Workspace.FallenPartsDestroyHeight = St.originalFallenHeight end end})
-Tabs.Combat:AddToggle("TglDomainTP", {Title="No Domain TP", Default=false, Callback=function(v) St.noDomainTP = v end})
+-- Auto Downslam sits at the very top of the Combat tab.
 Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, Callback=function(v) St.autoDownslamEnabled = v end})
+
+-- 0.2 Kill All: sweep / cycle-hunt / reset / AC tools all live together here.
+Tabs.Combat:AddSection("0.2 Kill All")
+Tabs.Combat:AddToggle("TglSweep", {Title="Sweep All", Default=false, Callback=function(v) St.sweepActive = v; if v then Workspace.FallenPartsDestroyHeight = Cfg.fallenHeight runSweep() else Workspace.FallenPartsDestroyHeight = St.originalFallenHeight end end})
+Tabs.Combat:AddToggle("TglSweepOverlay", {Title="Show Sweep Target Overlay", Default=false, Callback=function(v) St.overlayEnabled = v if v then buildOverlay() else destroyOverlay() end end})
 Tabs.Combat:AddButton({Title="Hunt for Cycle", Callback=runHunt})
+Tabs.Combat:AddButton({Title="Stop Hunt", Callback=stopHunt})
+Tabs.Combat:AddToggle("TglDomainTP", {Title="No Domain TP", Default=false, Callback=function(v) St.noDomainTP = v end})
 Tabs.Combat:AddButton({Title="Force Reset", Callback=forceReset})
 Tabs.Combat:AddButton({Title="Check AC Status", Callback=checkACStatus})
 
@@ -3501,15 +3538,13 @@ else
     --  Fly and Black Flash already have dedicated float buttons that appear automatically
     --  when their feature is enabled, so these were redundant.)
     mbBtn("MbYonk", "Show Yonk Button", "YonkBtn")
-    mbBtn("MbEmote", "Show Emote Button", "EmoteBtn")
+    -- Show Emote Button moved here from Settings -- uses the canonical emote overlay toggle.
+    Tabs.Keybinds:AddToggle("TglMainOverlay", {Title="Show Emote Button", Default=false, Callback=function(v) if _G.ToggleMainOverlay then _G.ToggleMainOverlay(v) end end})
 end
 
 -- [SETTINGS]
 Tabs.Settings:AddSection("Float Overlays & Visuals")
-Tabs.Settings:AddToggle("TglSweepOverlay", {Title="Show Sweep Target Overlay", Default=false, Callback=function(v) St.overlayEnabled = v if v then buildOverlay() else destroyOverlay() end end})
-
 if mobile then
-    Tabs.Settings:AddToggle("TglMainOverlay", {Title="Show Emote Button", Default=false, Callback=function(v) if _G.ToggleMainOverlay then _G.ToggleMainOverlay(v) end end})
     Tabs.Settings:AddSlider("SldBtnSize", {Title="Mobile Button Size", Min=0.6, Max=1.8, Default=1, Rounding=2, Callback=function(v) if _G.NH_ApplyBtnScale then _G.NH_ApplyBtnScale(v) end end})
     Tabs.Settings:AddToggle("TglLockBtns", {Title="Lock Buttons In Place (no dragging)", Default=false, Callback=function(v) _G.NH_btnLocked = v end})
 end
@@ -3601,6 +3636,28 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                     -- Fly / Lock-On look exactly, just with their NAME instead of an icon.
                     Instance.new("UICorner", clone).CornerRadius = UDim.new(1, 0)
                 end
+                -- NATIVE DETAILING: every Roblox mobile control button has a thin outer rim plus a
+                -- smaller inset ring. Re-create that here so text buttons match the Fly / Lock-On
+                -- look (which get it from their icon art) instead of being a flat circle.
+                local rim = Instance.new("UIStroke")
+                rim.Name = "NHRim"
+                rim.Color = Color3.fromRGB(255, 255, 255)
+                rim.Transparency = 0.5
+                rim.Thickness = 1.5
+                rim.Parent = clone
+                local ring = Instance.new("Frame")
+                ring.Name = "NHRing"
+                ring.AnchorPoint = Vector2.new(0.5, 0.5)
+                ring.Position = UDim2.fromScale(0.5, 0.5)
+                ring.Size = UDim2.fromScale(0.74, 0.74)
+                ring.BackgroundTransparency = 1
+                ring.ZIndex = 2
+                ring.Parent = clone
+                Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
+                local ringStroke = Instance.new("UIStroke", ring)
+                ringStroke.Color = Color3.fromRGB(255, 255, 255)
+                ringStroke.Transparency = 0.78
+                ringStroke.Thickness = 1
                 local lbl = Instance.new("TextLabel")
                 lbl.Name = "NHLbl"
                 lbl.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -3623,6 +3680,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
 
     if not f then
         f = Instance.new("Frame", gui); f.Size = UDim2.fromOffset(BASE,BASE); f.Position = UDim2.fromOffset(defX, defY); f.BackgroundColor3 = Color3.fromRGB(20,20,26); f.BackgroundTransparency = 0.35; Instance.new("UICorner", f).CornerRadius=UDim.new(1,0)
+        local frim = Instance.new("UIStroke", f); frim.Color = Color3.fromRGB(255,255,255); frim.Transparency = 0.5; frim.Thickness = 1.5
         l = Instance.new("TextLabel", f); l.Size = UDim2.new(1,-6,1,-6); l.Position = UDim2.fromScale(0.5,0.5); l.AnchorPoint = Vector2.new(0.5,0.5); l.BackgroundTransparency=1; l.Text = text; l.TextColor3 = Color3.fromRGB(255,255,255); l.Font = Enum.Font.GothamBold; l.TextScaled = true; l.TextWrapped = true
         local consF = Instance.new("UITextSizeConstraint", l); consF.MaxTextSize = 14
         b = Instance.new("TextButton", f); b.Size = UDim2.new(1,0,1,0); b.BackgroundTransparency=1; b.Text = ""
@@ -3663,7 +3721,7 @@ local function createFloatButton(id, text, defX, defY, c1, c2, action, isHoldBtn
                         local bs = f.AbsoluteSize
                         local bw = (bs.X > 0 and bs.X or BASE)
                         local bh = (bs.Y > 0 and bs.Y or BASE)
-                        local gap = math.floor(bh * 0.3)
+                        local gap = math.floor(bh * 0.1)  -- small gap: keeps Fly just a tad above Special (lowered per request)
                         -- centre horizontally on the target button, sit just above it
                         local x = ap.X + (asz.X - bw) * 0.5
                         local y = ap.Y - bh - gap
@@ -3900,7 +3958,7 @@ if mobile then
         {gui = yonkGui,  on = function() return St.yonkEnabled end},
         -- EMOTE is an instant tap-to-fire button with no feature state, so it has
         -- nothing to auto-follow. It stays hidden unless you opt in via
-        -- Settings > "Show Emote Button". Once on, it persists for quick taps.
+        -- Keybinds > "Show Emote Button". Once on, it persists for quick taps.
         {gui = emoteGui, on = function() return _G.mainOverlayMaster == true end},
     }
     -- Each feature button shows ONLY while its own feature is active. No master
