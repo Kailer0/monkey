@@ -129,8 +129,8 @@ local St = {
     whitelist = {}, originalFallenHeight = Workspace.FallenPartsDestroyHeight,
     kokusenSelectedTarget = "", kokusenIsExecuting = false, autoYutaEnabled = false,
     dashMultiplierEnabled = false, dashMultiplierValue = 1, yonkEnabled = false, yonkSpeed = 1, yonkAnimTrack = nil, yonkAnim = nil,
-    autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, autoUppercutEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
-    todoEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false,
+    autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, downslamMode = "blatant", autoUppercutEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
+    todoEnabled = false, todoBlackFlashEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false,
     bfLastAttackTime = {}, bfTargetLookSmoothed = {}, bfPrevTargetPos = {}, bfPrevTargetTime = {},
     StatusParagraph = nil, invisAnimTrack = nil,
 }
@@ -1484,13 +1484,88 @@ do
     -- Only convert a NEUTRAL hit (false/nil). An explicit "Up"/"Down" the game already chose
     -- (airborne finisher, jump-cancel, etc.) passes through untouched.
     local function wantDown(dir)
-        return St.autoDownslamEnabled and (dir == false or dir == nil)
+        -- BLATANT only: instantly rewrite a neutral M1 -> "Down". In LEGIT mode we leave the
+        -- remote untouched and instead jump at combo-3 (see the legit controller below).
+        return St.autoDownslamEnabled and St.downslamMode == "blatant" and (dir == false or dir == nil)
     end
     -- Auto Uppercut is the exact mirror of downslam: rewrite a NEUTRAL grounded hit
     -- (false/nil) into "Up" -- the same value the game uses for jump uppercuts --
     -- so every grounded M1 launches as an uppercut. Mutually exclusive with downslam.
     local function wantUp(dir)
         return St.autoUppercutEnabled and (dir == false or dir == nil)
+    end
+
+    -- ===== Legit Downslam combo tracker =====
+    -- LEGIT mode rewrites NOTHING. We count genuine M1s off the SAME "Activated" signal the
+    -- hooks below already see (guaranteed to fire -- that's how blatant works), and on the 3rd
+    -- hit we force the character airborne, so the GAME itself computes your 4th M1 as "Down".
+    -- The hop uses a state change + Humanoid.Jump + a direct upward velocity so it lifts off
+    -- even while the attack state would normally swallow a plain Humanoid.Jump. Mobile + PC.
+    local legitCombo, legitLastM1T, legitComboT = 0, 0, 0
+    local legitArmed = true
+    local function legitJump()
+        local chr = LocalPlayer.Character
+        if not chr then return end
+        local hum = chr:FindFirstChildOfClass("Humanoid")
+        local hrp = chr:FindFirstChild("HumanoidRootPart")
+        if hum then
+            pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end)
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            hum.Jump = true
+        end
+        if hrp then
+            local v = hrp.AssemblyLinearVelocity
+            hrp.AssemblyLinearVelocity = Vector3.new(v.X, 50, v.Z)
+        end
+    end
+    -- Only treat an M1 as "landed" when a live enemy is within 10 studs -- this stops the legit
+    -- hop from firing on whiffed air swings (which felt like random jumps).
+    local function legitHittingSomeone()
+        local chr = LocalPlayer.Character
+        local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
+        if not hrp then return false end
+        local folder = Workspace:FindFirstChild("Characters")
+        if not folder then return false end
+        for _, obj in ipairs(folder:GetChildren()) do
+            if obj:IsA("Model") and obj ~= chr then
+                local hum = obj:FindFirstChild("Humanoid")
+                local part = obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart")
+                if hum and part and hum.Health > 0 and (part.Position - hrp.Position).Magnitude <= 10 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    local function noteLegitM1()
+        if not (St.autoDownslamEnabled and St.downslamMode == "legit") then return end
+        local chr = LocalPlayer.Character
+        if not chr then return end
+        -- Don't hop on whiffs: only react to M1s thrown with an enemy within 10 studs.
+        if not legitHittingSomeone() then return end
+        -- PREFERRED: gate on the game's REAL combo counter so we hop EXACTLY ONCE, on the 3rd
+        -- hit, no matter how many times the M1 remote fires per tap. (That was the "jump every
+        -- click" bug -- our manual counter raced because Activated can fire several times a tap.)
+        local m1 = chr:GetAttribute("CurrentM1")
+        if type(m1) == "number" then
+            if m1 < 3 then
+                legitArmed = true                 -- early in the combo -> re-arm for next finisher
+            elseif legitArmed then
+                legitArmed = false                -- 3rd+ hit reached -> hop ONCE this combo
+                legitJump()
+            end
+            return
+        end
+        -- FALLBACK (combo attribute unavailable): manual count, de-duped by time so the repeated
+        -- Activated calls for ONE tap collapse into a single counted M1.
+        local now = tick()
+        if now - legitLastM1T < 0.12 then return end
+        legitLastM1T = now
+        if now - legitComboT > 1.2 then legitCombo = 0 end
+        legitComboT = now
+        legitCombo = legitCombo + 1
+        if legitCombo == 3 then legitJump() end
+        if legitCombo >= 4 then legitCombo = 0 end
     end
 
     -- ---- PRIMARY: ToolController.UseSetService table hook (PC + mobile) ----
@@ -1511,6 +1586,7 @@ do
                     -- moveset remote directly (not via UseSetService) and are also guarded by
                     -- lastAutoM1, so they never false-trigger this.
                     if _G.NH_tryBlockBreak then task.spawn(_G.NH_tryBlockBreak) end
+                    noteLegitM1()
                     if wantDown(dir) then dir = "Down" elseif wantUp(dir) then dir = "Up" end
                 end
                 return _G.NH_origUSS(self, name, dir, ...)
@@ -1541,6 +1617,7 @@ do
                 -- Genuine user M1 on this moveset's Activated remote -> run the block-break check
                 -- (moveset-agnostic). lastAutoM1 inside the check ignores our own auto-M1s.
                 if _G.NH_tryBlockBreak then task.spawn(_G.NH_tryBlockBreak) end
+                noteLegitM1()
                 local a = { ... }
                 if wantDown(a[1]) then
                     a[1] = "Down"
@@ -3246,6 +3323,7 @@ local Tabs = {
 -- [COMBAT]
 -- Auto Downslam sits at the very top of the Combat tab.
 Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, Callback=function(v) St.autoDownslamEnabled = v; if v then St.autoUppercutEnabled = false; pcall(function() Fluent.Options.TglAutoUppercut:SetValue(false) end) end end})
+Tabs.Combat:AddDropdown("DpDownslamMode", {Title="Auto Downslam Method", Values={"Blatant", "Legit"}, Default="Blatant", Callback=function(v) St.downslamMode = string.lower(v) end})
 Tabs.Combat:AddToggle("TglAutoUppercut", {Title="Auto Uppercut", Default=false, Callback=function(v) St.autoUppercutEnabled = v; if v then St.autoDownslamEnabled = false; pcall(function() Fluent.Options.TglAutoDownslam:SetValue(false) end) end end})
 
 -- 0.2 Kill All: sweep / cycle-hunt / reset / AC tools all live together here.
@@ -3259,7 +3337,7 @@ Tabs.Combat:AddButton({Title="Force Reset", Callback=forceReset})
 Tabs.Combat:AddButton({Title="Check AC Status", Callback=checkACStatus})
 
 local LockOnSection = Tabs.Combat:AddSection("Lock-On System")
-Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, aim your camera so the enemy is near the middle of your screen, then press the LOCK ON button to lock onto them. Aim at someone else and press again to switch, or press while aiming at your current target (or at empty space) to unlock. Screen taps no longer lock, so moving your camera around won't grab random players."})
+Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, aim your camera so the enemy is near the middle of your screen, then press the LOCK ON button to lock onto them. Aim at someone else and press again to switch, or press while aiming at your current target (or at empty space) to unlock."})
 
 Tabs.Combat:AddToggle("TglLockOn", {
     Title="Lock-On Enable (Mobile)", 
@@ -3409,7 +3487,53 @@ Tabs.Movement:AddToggle("TglBFAutoFlash", {Title="Auto Flash on Arrival", Defaul
 Tabs.Movement:AddToggle("TglBFChain", {Title="Chain Reposition", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CHAIN", v) end end})
 
 -- [CHARACTERS]
+-- ===== Auto Todo Black Flash =====
+-- Auto follow-ups for Todo: listens on the character's Humanoid.AnimationPlayed and fires the
+-- matching remote when a Black Flash setup animation plays.
+--   111720035828971 -> wait .8s -> TodoService.RightActivated
+--   100081544058065 -> fire Brute Force twice (.75s apart)
+_G.TODOBLACKFLASH = _G.TODOBLACKFLASH or {}
+local function disconnectTodoBlackFlash()
+    if _G.TODOBLACKFLASH then
+        for _, c in ipairs(_G.TODOBLACKFLASH) do pcall(function() c:Disconnect() end) end
+    end
+    _G.TODOBLACKFLASH = {}
+    if _G.TODOBLACKFLASH_CHARCONN then
+        pcall(function() _G.TODOBLACKFLASH_CHARCONN:Disconnect() end)
+        _G.TODOBLACKFLASH_CHARCONN = nil
+    end
+end
+local function todoBlackFlashConnectCharacter(character)
+    local humanoid = character:WaitForChild("Humanoid")
+    table.insert(_G.TODOBLACKFLASH, humanoid.AnimationPlayed:Connect(function(track)
+        if not St.todoBlackFlashEnabled then return end
+        local id = track.Animation and track.Animation.AnimationId
+        if id == "rbxassetid://111720035828971" then
+            task.wait(.8)
+            pcall(function() ReplicatedStorage.Knit.Knit.Services.TodoService.RE.RightActivated:FireServer() end)
+        end
+    end))
+    table.insert(_G.TODOBLACKFLASH, humanoid.AnimationPlayed:Connect(function(track)
+        if not St.todoBlackFlashEnabled then return end
+        local id = track.Animation and track.Animation.AnimationId
+        if id == "rbxassetid://100081544058065" then
+            local moveset = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Moveset")
+            local bf = moveset and moveset:FindFirstChild("Brute Force")
+            if not bf then return end
+            pcall(function() ReplicatedStorage.Knit.Knit.Services.BruteForceService.RE.Activated:FireServer(bf) end)
+            task.wait(.75)
+            pcall(function() ReplicatedStorage.Knit.Knit.Services.BruteForceService.RE.Activated:FireServer(bf) end)
+        end
+    end))
+end
+local function enableTodoBlackFlash()
+    disconnectTodoBlackFlash()
+    if LocalPlayer.Character then todoBlackFlashConnectCharacter(LocalPlayer.Character) end
+    _G.TODOBLACKFLASH_CHARCONN = LocalPlayer.CharacterAdded:Connect(todoBlackFlashConnectCharacter)
+end
+
 Tabs.Characters:AddToggle("TglTodoClap", {Title="Todo Perfect Clap", Default=false, Callback=function(v) St.todoEnabled = v if v then notify("Todo", "Perfect Clap enabled.", 2) end end})
+Tabs.Characters:AddToggle("TglTodoBlackFlash", {Title="Auto Todo Black Flash", Default=false, Callback=function(v) St.todoBlackFlashEnabled = v if v then enableTodoBlackFlash() notify("Todo", "Auto Black Flash enabled.", 2) else disconnectTodoBlackFlash() notify("Todo", "Auto Black Flash disabled.", 2) end end})
 Tabs.Characters:AddButton({Title="Instant Blackhole (Yuki)", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/InstantBlackHole.JJS"))() end) end})
 Tabs.Characters:AddToggle("TglNanami", {
     Title="Auto Nanami Ratio", 
