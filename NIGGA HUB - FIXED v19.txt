@@ -130,7 +130,10 @@ local St = {
     kokusenSelectedTarget = "", kokusenIsExecuting = false, autoYutaEnabled = false,
     dashMultiplierEnabled = false, dashMultiplierValue = 1, yonkEnabled = false, yonkSpeed = 1, yonkAnimTrack = nil, yonkAnim = nil,
     autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, downslamMode = "blatant", autoUppercutEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
-    todoEnabled = false, todoBlackFlashEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false, autoProjBlockEnabled = false,
+    todoEnabled = false, todoBlackFlashEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false, autoProjBlockEnabled = false, autoHarutaDodgeEnabled = false,
+    harutaBackstabEnabled = false,
+    bfChainBtnEnabled = false,
+    harutaBsBtnEnabled = false,
     bfLastAttackTime = {}, bfTargetLookSmoothed = {}, bfPrevTargetPos = {}, bfPrevTargetTime = {},
     StatusParagraph = nil, invisAnimTrack = nil,
 }
@@ -141,7 +144,7 @@ local Cn = {
 }
 
 local Keys = {
-    sweepKey = Enum.KeyCode.E, huntKey = Enum.KeyCode.Y, stopKey = Enum.KeyCode.H, bfKey = Enum.KeyCode.G, flyKey = Enum.KeyCode.X, yonkKey = Enum.KeyCode.J, lockOnKey = Enum.KeyCode.C, voidKey = Enum.KeyCode.V, emoteKey = Enum.KeyCode.Z
+    sweepKey = Enum.KeyCode.E, huntKey = Enum.KeyCode.Y, stopKey = Enum.KeyCode.H, bfKey = Enum.KeyCode.G, flyKey = Enum.KeyCode.X, yonkKey = Enum.KeyCode.J, lockOnKey = Enum.KeyCode.C, voidKey = Enum.KeyCode.V, emoteKey = Enum.KeyCode.Z, harutaBsKey = Enum.KeyCode.Two, bfChainKey = Enum.KeyCode.Three
 }
 local flyKeys = { W=false, A=false, S=false, D=false, Up=false, Down=false, Boost=false }
 
@@ -1837,6 +1840,7 @@ do
         MeleeRange = 10,
         DashDetectRange = 25,
         ProjectileRange = 80,
+        HarutaDodgeRange = 14,   -- studs: max attacker distance for the swordless-Haruta auto-dodge
     }
 
     getgenv().userIsBlocking = false
@@ -1894,6 +1898,24 @@ do
         local dir = (theirHRP.Position - hrp.Position) * Vector3.new(1, 0, 1)
         if dir.Magnitude < 0.1 then return end
         hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir.Unit)
+    end
+
+    -- ── Auto Haruta Dodge ────────────────────────────────────────────────────
+    -- In JJS, swordless Haruta's "dodge" IS the Block input pressed at the perfect
+    -- moment (the white-circle window). So the dodge is just a precisely-timed Block
+    -- tap on the same BlockService remote we already use. We fire a short tap
+    -- (Activated -> Deactivated) so it reads as a quick dodge press and does not
+    -- linger as a held block. Independent of the auto-block state machine.
+    local harutadodgdb = 0
+    local function fireHarutaDodge()
+        pcall(function() BlockActivated:FireServer() end)
+        task.delay(0.16, function()
+            -- only release if the normal auto-block isn't actively holding a block,
+            -- so we never cancel a real block mid-hold.
+            if not getgenv().blockState.active then
+                pcall(function() BlockDeactivated:FireServer() end)
+            end
+        end)
     end
 
     local lastAutoM1 = 0
@@ -2015,7 +2037,7 @@ do
 
         faceTarget(theirHRP)
         if St.autoBlockEnabled or St.autoPunishEnabled then
-            getgenv().blockState.holdFrames = compHoldFrames(Config.AutoBlockHoldFrames)
+            getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames  -- flat v12 hold: fast block/unblock, no ping padding so it doesn't sit on the guard
             forceStartBlock()
         end
 
@@ -2420,7 +2442,12 @@ do
                 if not M1_ANIMS[id] then continue end
                 if track.Length <= 0 then continue end
 
-                local pingThreshold = math.clamp(1 - ping * 0.7, 0.15, 0.95)
+                -- normal early-window auto-block runs only on its own toggles
+                if not St.autoBlockEnabled and not St.autoPunishEnabled then continue end
+
+                -- Ping-adjusted threshold (restored to match Auto Block v12 exactly):
+                -- block earlier in the enemy's M1 animation the higher your ping is.
+                local pingThreshold = math.clamp(1 - ping, 0.05, 0.95)
                 local pct = track.TimePosition / track.Length
 
                 if dist > Config.MeleeRange then continue end  -- M1s only at melee range
@@ -2433,7 +2460,7 @@ do
 
                     faceTarget(theirHRP)
                     if St.autoBlockEnabled or St.autoPunishEnabled then
-                        getgenv().blockState.holdFrames = compHoldFrames(Config.AutoBlockHoldFrames)
+                        getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames  -- flat v12 hold: fast block/unblock, no ping padding so it doesn't sit on the guard
                         forceStartBlock()
                     end
 
@@ -3675,6 +3702,207 @@ end
 local bfStartAll = _G.bfStartAll; local bfStopAll = _G.bfStopAll; local bfTriggerDash = _G.bfTriggerDash
 
 -- ============================================================
+-- HARUTA AUTO BACKSTAB  (dash behind + fire Backstab move)
+--   Uses the BF chain's curved dash engine to get behind the
+--   target, then fires Haruta's 2nd move (Backstab). Works on
+--   PC (keybind) and mobile (float button). Safety: won't dash
+--   if target is ragdolled / knocked back / self is stunned.
+--   Requires Haruta with sword equipped.
+-- ============================================================
+do
+    local BS_RANGE      = 16
+    local BS_DEBOUNCE   = 0.5
+    local bsBusy        = false
+    local bsDebounce    = 0
+
+    local function harutaBsSelfBlocked()
+        local ch  = LocalPlayer.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not ch or not hum or not hrp or hum.Health <= 0 then return true end
+        if (ch:GetAttribute("Ragdoll") or 0) ~= 0 then return true end
+        if ch:FindFirstChild("Stun") or ch:FindFirstChild("Knockback") or ch:FindFirstChild("Hold")
+            or ch:FindFirstChild("Grab") or ch:FindFirstChild("Grabbed") or ch:FindFirstChild("Carry") then
+            return true
+        end
+        local st = hum:GetState()
+        if st == Enum.HumanoidStateType.Ragdoll or st == Enum.HumanoidStateType.FallingDown
+            or st == Enum.HumanoidStateType.PlatformStanding then return true end
+        return false
+    end
+
+    local function isTargetRagdolled(target)
+        if not target then return true end
+        if (target:GetAttribute("Ragdoll") or 0) ~= 0 then return true end
+        local hum = target:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local st = hum:GetState()
+            if st == Enum.HumanoidStateType.Ragdoll or st == Enum.HumanoidStateType.FallingDown then return true end
+        end
+        return false
+    end
+
+    local function harutaBsFindTarget()
+        local ch  = LocalPlayer.Character
+        if not ch then return nil end
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        if not hrp then return nil end
+        local closest, closestDist = nil, BS_RANGE + 1
+        local folder = Workspace:FindFirstChild("Characters")
+        if folder then
+            for _, obj in ipairs(folder:GetChildren()) do
+                if obj:IsA("Model") and obj ~= ch then
+                    local hum  = obj:FindFirstChild("Humanoid")
+                    local part = obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart")
+                    if hum and part and hum.Health > 0 and not isTargetRagdolled(obj) then
+                        local dist = (part.Position - hrp.Position).Magnitude
+                        if dist <= BS_RANGE and dist < closestDist then
+                            closestDist, closest = dist, obj
+                        end
+                    end
+                end
+            end
+        end
+        return closest, closestDist
+    end
+
+    local function harutaBsFireMove()
+        local ch = LocalPlayer.Character
+        if not ch then return false end
+        if mobile then
+            local tc = nhGetToolController()
+            if tc then
+                pcall(function() tc:UseKey(2, "Activated") end)
+                task.wait(0.02)
+                pcall(function() tc:UseKey(2, "Deactivated") end)
+                return true
+            end
+        else
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Two, false, game)
+            task.wait(0.02)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Two, false, game)
+            return true
+        end
+        return false
+    end
+
+    local function triggerHarutaBackstab()
+        if bsBusy then notify("Haruta BS", "Busy - wait", 2); return end
+
+        local ch = LocalPlayer.Character
+        if not ch then notify("Haruta BS", "No character", 2); return end
+
+        local mv = ch:GetAttribute("Moveset")
+        if mv ~= "Haruta" then notify("Haruta BS", "Not Haruta (have: "..tostring(mv)..")", 2); return end
+
+        local assets = ch:FindFirstChild("SetAssets")
+        if not (assets and assets:FindFirstChild("HarutaSword")) then notify("Haruta BS", "No sword equipped", 2); return end
+
+        if harutaBsSelfBlocked() then notify("Haruta BS", "Stunned / ragdolled", 2); return end
+
+        local target = harutaBsFindTarget()
+        if not target then notify("Haruta BS", "No target in "..BS_RANGE.." studs", 2); return end
+
+        if tick() - bsDebounce < BS_DEBOUNCE then return end
+        bsDebounce = tick()
+        bsBusy = true
+
+        local targetRef = target
+        local charRef = ch
+
+        local function onArrive()
+            if not targetRef or not targetRef.Parent then bsBusy = false; return end
+            if isTargetRagdolled(targetRef) then bsBusy = false; return end
+            local myHRP = charRef and charRef:FindFirstChild("HumanoidRootPart")
+            local tHRP  = targetRef:FindFirstChild("HumanoidRootPart")
+            if myHRP and tHRP then
+                local fd = (tHRP.Position - myHRP.Position) * Vector3.new(1, 0, 1)
+                if fd.Magnitude > 0.1 then
+                    myHRP.CFrame = CFrame.lookAt(myHRP.Position, myHRP.Position + fd.Unit)
+                end
+            end
+            task.wait(0.08)
+            harutaBsFireMove()
+            task.delay(0.4, function() bsBusy = false end)
+        end
+
+        local ok = false
+        if _G.NH_dashBehind then
+            ok = _G.NH_dashBehind(targetRef, onArrive)
+        else
+            notify("Haruta BS", "Dash engine not loaded", 2)
+        end
+
+        if ok == false then
+            notify("Haruta BS", "Dash failed (bf busy / self blocked)", 2)
+            bsBusy = false
+        end
+        task.delay(2.5, function() bsBusy = false end)
+    end
+
+    _G.NH_triggerHarutaBackstab = triggerHarutaBackstab
+end
+
+-- ============================================================
+-- MOBILE MOVE-KEY INTERCEPT (2nd and 3rd ability buttons)
+-- On mobile, the game's 2nd/3rd move buttons fire ToolController:UseKey(n, "Activated").
+-- When Haruta Backstab or BF Chain are enabled on mobile, we intercept UseKey for
+-- slots 2 and 3 respectively. If the right character is equipped, we trigger our
+-- feature instead. If the wrong character is equipped, we pass through normally with
+-- NO notification (notification only comes from the dedicated UI buttons).
+-- ============================================================
+if mobile then
+    task.spawn(function()
+        -- Wait for Knit + ToolController
+        task.wait(1)
+        local ok, Knit = pcall(function() return require(ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit")) end)
+        if not ok or not Knit then return end
+        local tc = nil
+        pcall(function() tc = Knit.GetController("ToolController") end)
+        if not tc or type(tc.UseKey) ~= "function" then return end
+
+        local origUseKey = tc.UseKey
+        local _hookActive = false
+        tc.UseKey = function(self, slot, eventName, ...)
+            -- Guard: if we're already inside our hook (e.g. BF system calling UseKey internally), pass through
+            if _hookActive then return origUseKey(self, slot, eventName, ...) end
+            -- Intercept slot 2 (Haruta Backstab)
+            if slot == 2 and eventName == "Activated" and St.harutaBackstabEnabled then
+                local ch = LocalPlayer.Character
+                local mv = ch and ch:GetAttribute("Moveset")
+                if mv == "Haruta" then
+                    -- Haruta equipped: trigger backstab, suppress normal move
+                    task.spawn(function()
+                        local assets = ch and ch:FindFirstChild("SetAssets")
+                        if not (assets and assets:FindFirstChild("HarutaSword")) then
+                            notify("Haruta Backstab", "Need sword in hand to backstab.", 3)
+                            return
+                        end
+                        if _G.NH_triggerHarutaBackstab then _G.NH_triggerHarutaBackstab() end
+                    end)
+                    return -- suppress the default slot-2 fire
+                end
+                -- Not Haruta: fall through silently, no notification
+            end
+
+            -- Intercept slot 3 (BF Chain)
+            if slot == 3 and eventName == "Activated" and St.bfEnabled then
+                local ch = LocalPlayer.Character
+                -- BF chain fires on any character when enabled (it's character-agnostic)
+                task.spawn(function()
+                    _hookActive = true
+                    bfTriggerDash()
+                    _hookActive = false
+                end)
+                return -- suppress default slot-3 fire
+            end
+
+            return origUseKey(self, slot, eventName, ...)
+        end
+    end)
+end
+
+-- ============================================================
 -- SWEEP OVERLAY GUI
 -- ============================================================
 local OL={W=244,TITLE=32,ROW_H=32}
@@ -3790,6 +4018,12 @@ local Tabs = {
 Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, Callback=function(v) St.autoDownslamEnabled = v; if v then St.autoUppercutEnabled = false; pcall(function() Fluent.Options.TglAutoUppercut:SetValue(false) end) end end})
 Tabs.Combat:AddDropdown("DpDownslamMode", {Title="Auto Downslam Method", Values={"Blatant", "Legit"}, Default="Blatant", Callback=function(v) St.downslamMode = string.lower(v) end})
 Tabs.Combat:AddToggle("TglAutoUppercut", {Title="Auto Uppercut", Default=false, Callback=function(v) St.autoUppercutEnabled = v; if v then St.autoDownslamEnabled = false; pcall(function() Fluent.Options.TglAutoDownslam:SetValue(false) end) end end})
+
+Tabs.Combat:AddSection("Auto Blocking")
+Tabs.Combat:AddToggle("TglAutoBlockC", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v) St.autoBlockEnabled = v if v then notify("Auto Block", "Auto Block + Dash Predict enabled.", 2) else if _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Block", "Disabled.", 2) end end})
+Tabs.Combat:AddToggle("TglAutoProjBlockC", {Title="Auto Projectile Block", Default=false, Callback=function(v) St.autoProjBlockEnabled = v if v then notify("Auto Projectile Block", "ON - instantly blocks incoming projectiles.", 3) else if not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Projectile Block", "Disabled.", 2) end end})
+Tabs.Combat:AddToggle("TglAutoPunishC", {Title="Auto Punish", Default=false, Callback=function(v) St.autoPunishEnabled = v notify("Auto Punish", v and "Enabled - auto-M1 after a successful block." or "Disabled.", 2) end})
+Tabs.Combat:AddToggle("TglAutoBlockBreakC", {Title="Auto Block Break", Default=false, Callback=function(v) St.autoBlockBreakEnabled = v notify("Auto Block Break", v and "Enabled - dash behind blockers when you M1." or "Disabled.", 2) end})
 
 -- 0.2 Kill All: sweep / cycle-hunt / reset / AC tools all live together here.
 Tabs.Combat:AddSection("0.2 Kill All")
@@ -3997,7 +4231,19 @@ local function enableTodoBlackFlash()
     _G.TODOBLACKFLASH_CHARCONN = LocalPlayer.CharacterAdded:Connect(todoBlackFlashConnectCharacter)
 end
 
-Tabs.Characters:AddToggle("TglTodoClap", {Title="Todo Perfect Clap", Default=false, Callback=function(v) St.todoEnabled = v if v then notify("Todo", "Perfect Clap enabled.", 2) end end})
+Tabs.Characters:AddSection("Haruta Backstab")
+Tabs.Characters:AddParagraph({Title="Haruta Backstab Info", Content="As Haruta (with sword equipped), press key 2 on PC or the BACKSTAB mobile button to dash behind your nearest target and fire the Backstab move. Toggle this on to enable.\n\nMobile: pressing your 2nd move while Haruta Backstab is enabled will dash+backstab. Use the 'Show Backstab Button' toggle below to also get a dedicated on-screen button.\n\nIf you are NOT Haruta on mobile and tap the button, you'll get a notification. On PC the key just acts normally for your current character."})
+Tabs.Characters:AddToggle("TglHarutaBs", {Title="Haruta Backstab", Default=false, Callback=function(v) St.harutaBackstabEnabled = v if v then notify("Haruta Backstab", "Enabled - equip sword, press 2 (PC) or move button/BACKSTAB (mobile).", 3) else notify("Haruta Backstab", "Disabled.", 2) end end})
+if mobile then
+    Tabs.Characters:AddToggle("TglHarutaBsBtn", {Title="Show Backstab UI Button", Default=false, Callback=function(v) St.harutaBsBtnEnabled = v end})
+end
+
+Tabs.Characters:AddSection("Todo")
+Tabs.Characters:AddParagraph({Title="Black Flash Chain Info", Content="Mobile: pressing your 3rd move while BF Chain is enabled will trigger a dash+flash. Use 'Show BF Chain Button' to also get a dedicated on-screen button. If BF Chain is on but you're using a different character's 3rd move, the move fires normally with no notification."})
+Tabs.Characters:AddToggle("TglAutoBFC", {Title="Auto Black Flash Chain", Default=false, Callback=function(v) St.bfEnabled = v if v then bfStartAll() else bfStopAll() end end})
+if mobile then
+    Tabs.Characters:AddToggle("TglBFChainBtn", {Title="Show BF Chain UI Button", Default=false, Callback=function(v) St.bfChainBtnEnabled = v end})
+end
 Tabs.Characters:AddToggle("TglTodoBlackFlash", {Title="Auto Todo Black Flash", Default=false, Callback=function(v) St.todoBlackFlashEnabled = v if v then enableTodoBlackFlash() notify("Todo", "Auto Black Flash enabled.", 2) else disconnectTodoBlackFlash() notify("Todo", "Auto Black Flash disabled.", 2) end end})
 Tabs.Characters:AddButton({Title="Instant Blackhole (Yuki)", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/InstantBlackHole.JJS"))() end) end})
 Tabs.Characters:AddToggle("TglNanami", {
@@ -4123,6 +4369,8 @@ if not mobile then
     Tabs.Keybinds:AddKeybind("KbLock", {Title="Lock-On Key", Default="C", Mode="Toggle", ChangedCallback=function(new) Keys.lockOnKey = new end})
     Tabs.Keybinds:AddKeybind("KbYonk", {Title="Yonk Key", Default="J", Mode="Toggle", ChangedCallback=function(new) Keys.yonkKey = new end})
     Tabs.Keybinds:AddKeybind("KbEmote", {Title="Auto Emote Key", Default="Z", Mode="Toggle", ChangedCallback=function(new) Keys.emoteKey = new end})
+    Tabs.Keybinds:AddKeybind("KbHarutaBs", {Title="Haruta Backstab Key (default: 2)", Default="Two", Mode="Toggle", ChangedCallback=function(new) Keys.harutaBsKey = new end})
+    Tabs.Keybinds:AddKeybind("KbBFChain", {Title="BF Chain Key (default: 3)", Default="Three", Mode="Toggle", ChangedCallback=function(new) Keys.bfChainKey = new end})
     Tabs.Keybinds:AddKeybind("KbVoid", {Title="Void Key", Default="V", Mode="Toggle", ChangedCallback=function(new) Keys.voidKey = new end})
 else
     -- MOBILE: phones can't bind keyboard keys, so instead each box below drops a draggable
@@ -4134,9 +4382,13 @@ else
     end
     mbBtn("MbSweep", "Show Sweep Button", "SweepBtn")
     mbBtn("MbHunt", "Show Hunt Button", "HuntBtn")
-    -- (Removed the mobile "Show Fly Button" and "Show BF Button" quick-access toggles:
-    --  Fly and Black Flash already have dedicated float buttons that appear automatically
-    --  when their feature is enabled, so these were redundant.)
+    mbBtn("MbBackstab", "Show Backstab Button", "BsBtn")
+    mbBtn("MbBFChain", "Show BF Chain Button", "BFChainBtn")
+    -- (Removed the mobile "Show Fly Button" quick-access toggle:
+    --  Fly already has a dedicated float button that appears automatically
+    --  when the feature is enabled, so it was redundant.)
+    -- Note: Haruta Backstab and BF Chain buttons can also be toggled per-feature
+    -- in the Characters tab via "Show Backstab UI Button" / "Show BF Chain UI Button".
     mbBtn("MbYonk", "Show Yonk Button", "YonkBtn")
     -- Show Emote Button moved here from Settings -- uses the canonical emote overlay toggle.
     Tabs.Keybinds:AddToggle("TglMainOverlay", {Title="Show Emote Button", Default=false, Callback=function(v) if _G.ToggleMainOverlay then _G.ToggleMainOverlay(v) end end})
@@ -4478,6 +4730,35 @@ if mobile then
         if St.bfEnabled then bfTriggerDash() return true end return false
     end, false)
 
+    local bsGui = createFloatButton("BsBtn", "BACKSTAB", vp.X-240, vp.Y-240, Color3.fromRGB(160,40,40), Color3.fromRGB(255,80,80), function()
+        -- Mobile UI button tap: only if harutaBackstabEnabled. Check char validity and notify if wrong.
+        if not St.harutaBackstabEnabled then return false end
+        local ch = LocalPlayer.Character
+        local mv = ch and ch:GetAttribute("Moveset")
+        if mv ~= "Haruta" then
+            notify("Haruta Backstab", "Need Haruta (Lucky Coward) equipped.", 3)
+            return false
+        end
+        local assets = ch:FindFirstChild("SetAssets")
+        if not (assets and assets:FindFirstChild("HarutaSword")) then
+            notify("Haruta Backstab", "Need sword in hand to backstab.", 3)
+            return false
+        end
+        if _G.NH_triggerHarutaBackstab then _G.NH_triggerHarutaBackstab() end
+        return true
+    end, false)
+
+    local bfChainGui = createFloatButton("BFChainBtn", "BF CHAIN", vp.X-320, vp.Y-240, Color3.fromRGB(100,40,160), Color3.fromRGB(200,80,255), function()
+        -- Mobile UI button tap: only fires if bfChainBtnEnabled. Notifies if BF not enabled or wrong char.
+        if not St.bfChainBtnEnabled then return false end
+        if not St.bfEnabled then
+            notify("BF Chain", "Enable Auto Black Flash Chain first.", 3)
+            return false
+        end
+        bfTriggerDash()
+        return true
+    end, false)
+
     local lockGui = createFloatButton("LockBtn", "LOCK ON", vp.X-80, vp.Y-240, Color3.fromRGB(30,80,220), Color3.fromRGB(80,200,255), function()
         -- MOBILE LOCK-ON (aim + press, 100% drag-proof):
         --   * Point your CAMERA at an enemy (put them near the middle of your screen).
@@ -4542,7 +4823,7 @@ if mobile then
     -- the "Show Boost Button" toggle. It is independent of the "Show Up / Down" toggle.
     local boostGui = createFloatButton("FlyBoostBtn", "BOOST", vp.X-240, vp.Y-160, Color3.fromRGB(200,50,50), Color3.fromRGB(255,100,100), function(state) flyKeys.Boost = state end, true)
 
-    for _, g in ipairs({flyGui, bfGui, lockGui, sweepGui, huntGui, yonkGui, emoteGui, boostGui}) do
+    for _, g in ipairs({flyGui, bfGui, bsGui, bfChainGui, lockGui, sweepGui, huntGui, yonkGui, emoteGui, boostGui}) do
         table.insert(_G.mainFloatGuis, g)
     end
 
@@ -4552,6 +4833,8 @@ if mobile then
         {gui = flyGui,   on = function() return St.flyToggleOn end},
         {gui = boostGui, on = function() return St.flyActive and _G.NH_boostVisible end},
         {gui = bfGui,    on = function() return St.bfEnabled end},
+        {gui = bsGui,       on = function() return St.harutaBackstabEnabled and St.harutaBsBtnEnabled end},
+        {gui = bfChainGui,  on = function() return St.bfChainBtnEnabled end},
         {gui = lockGui,  on = function() return St.lockOnEnabled end},
         {gui = sweepGui, on = function() return St.sweepActive end},
         {gui = huntGui,  on = function() return St.huntRunning end},
@@ -4839,6 +5122,23 @@ UserInputService.InputBegan:Connect(function(inp, gp)
     elseif k == Keys.flyKey then if Fluent.Options.TglFly then Fluent.Options.TglFly:SetValue(not Fluent.Options.TglFly.Value) end
     elseif k == Keys.yonkKey then yonkToggle()
     elseif k == Keys.emoteKey then fireSelectedEmote()
+    elseif k == Keys.harutaBsKey then
+        -- PC key 2: only fires Haruta Backstab if harutaBackstabEnabled AND we are Haruta.
+        -- If the feature is off OR we're not Haruta, let the game handle key 2 normally (no notification).
+        if St.harutaBackstabEnabled and _G.NH_triggerHarutaBackstab then
+            local ch = LocalPlayer.Character
+            local mv = ch and ch:GetAttribute("Moveset")
+            if mv == "Haruta" then
+                task.spawn(_G.NH_triggerHarutaBackstab)
+            end
+            -- if not Haruta, do nothing - game gets the key input normally
+        end
+    elseif k == Keys.bfChainKey then
+        -- PC key 3: only fires BF chain if bfEnabled AND feature is on.
+        -- If feature off or wrong char, do nothing - game gets key 3 normally.
+        if St.bfEnabled then
+            bfTriggerDash()
+        end
     elseif k == Keys.voidKey then forceReset()
     elseif k == Keys.stopKey then if Fluent.Options.TglSweep then Fluent.Options.TglSweep:SetValue(false) end end
     
