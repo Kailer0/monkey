@@ -87,7 +87,7 @@ local Cfg = {
     INVIS_ANIM_ID     = "rbxassetid://108081843941348",
     INVIS_FREEZE_TIME = 7,
     FlySpeed = 150,
-    LockOn = { Method = "Body", SideOffset = 0, Smoothness = 0.15, MaxDistance= 150, ESP = true },
+    LockOn = { Method = "Console", SideOffset = 0, Smoothness = 0.15, MaxDistance= 150, ESP = false, MarkerImage = 87061703528307 },
 }
 
 local EMOTE_LIST = {
@@ -130,7 +130,7 @@ local St = {
     kokusenSelectedTarget = "", kokusenIsExecuting = false, autoYutaEnabled = false,
     dashMultiplierEnabled = false, dashMultiplierValue = 1, yonkEnabled = false, yonkSpeed = 1, yonkAnimTrack = nil, yonkAnim = nil,
     autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, downslamMode = "blatant", autoUppercutEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
-    todoEnabled = false, todoBlackFlashEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false,
+    todoEnabled = false, todoBlackFlashEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false, autoProjBlockEnabled = false,
     bfLastAttackTime = {}, bfTargetLookSmoothed = {}, bfPrevTargetPos = {}, bfPrevTargetTime = {},
     StatusParagraph = nil, invisAnimTrack = nil,
 }
@@ -830,9 +830,17 @@ local function clearLockOnHighlight()
         St.lockOnHighlight = nil
     end
 end
--- Full teardown: drop the ESP highlight AND give the camera back to the player.
+-- Destroy ONLY the on-target console marker (the 4-triangle reticle).
+local function clearLockOnMarker()
+    if St.lockOnMarker then
+        pcall(function() St.lockOnMarker:Destroy() end)
+        St.lockOnMarker = nil
+    end
+end
+-- Full teardown: drop the ESP highlight + target marker AND give the camera back to the player.
 local function clearLockOnESP()
     clearLockOnHighlight()
+    clearLockOnMarker()
     restoreLockOnCamera()
 end
 local function updateLockOnESP()
@@ -856,6 +864,116 @@ local function updateLockOnESP()
     hl.OutlineTransparency = 0
     hl.Parent = char
     St.lockOnHighlight = hl
+end
+
+-- Console-style on-target marker: a 4-triangle reticle (top/bottom/left/right, each pointing
+-- inward) anchored to the target's HRP so you can always see who you're locked onto, even in
+-- close quarters. Shows whenever a target is locked, independent of the wall-ESP toggle.
+local function updateLockOnMarker()
+    if not St.lockOnEnabled or not St.lockOnTarget or not St.lockOnTarget.Core or not St.lockOnTarget.Core.Parent then
+        clearLockOnMarker()
+        return
+    end
+    local hrp = St.lockOnTarget.Core
+    if St.lockOnMarker and St.lockOnMarker.Adornee == hrp then return end  -- already marking this exact target
+    clearLockOnMarker()
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "NH_LockOnMarker"
+    bb.Adornee = hrp
+    bb.Size = UDim2.new(0, 185, 0, 185)
+    bb.AlwaysOnTop = true
+    bb.LightInfluence = 0
+    bb.MaxDistance = (Cfg.LockOn.MaxDistance or 150) + 25
+    bb.Parent = hrp
+    -- EXACT-IMAGE MODE: if you've uploaded the chevron PNG to Roblox, put its image asset ID in
+    -- Cfg.LockOn.MarkerImage (a number, e.g. 1234567890) and we render 4 rotated copies of YOUR
+    -- image around the target -- a pixel-perfect replica. If it's left at 0 we fall back to the
+    -- built-in vector chevrons so the marker always works.
+    local imgId = Cfg.LockOn.MarkerImage
+    if imgId and imgId ~= 0 and imgId ~= "" and imgId ~= "rbxassetid://0" then
+        -- A plain number is treated as a Decal/Image ASSET id and loaded via rbxthumb, which
+        -- renders correctly even when you uploaded it as a Decal (raw decal ids won't show in
+        -- ImageLabel.Image otherwise). Pass a full "rbxassetid://<imageId>" string instead if you
+        -- have the underlying IMAGE id and want to use it directly.
+        local imgStr
+        if typeof(imgId) == "number" then
+            imgStr = "rbxthumb://type=Asset&id=" .. imgId .. "&w=420&h=420"
+        else
+            imgStr = tostring(imgId)
+        end
+        local function arrow(rot, anchor, pos)
+            -- soft red glow layer behind: larger, tinted bright red, semi-transparent
+            local glow = Instance.new("ImageLabel")
+            glow.BackgroundTransparency = 1
+            glow.Size = UDim2.new(0, 72, 0, 72)
+            glow.AnchorPoint = anchor
+            glow.Position = pos
+            glow.Rotation = rot
+            glow.Image = imgStr
+            glow.ImageColor3 = Color3.fromRGB(255, 45, 45)
+            glow.ImageTransparency = 0.4
+            glow.ScaleType = Enum.ScaleType.Fit
+            glow.ZIndex = 1
+            glow.Parent = bb
+            -- crisp main chevron on top
+            local img = Instance.new("ImageLabel")
+            img.BackgroundTransparency = 1
+            img.Size = UDim2.new(0, 56, 0, 56)
+            img.AnchorPoint = anchor
+            img.Position = pos
+            img.Rotation = rot
+            img.Image = imgStr
+            img.ScaleType = Enum.ScaleType.Fit
+            img.ZIndex = 2
+            img.Parent = bb
+        end
+        -- PNG's apex points UP by default; rotate each copy so every apex faces OUTWARD.
+        arrow(0,   Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 0))   -- TOP, apex UP
+        arrow(180, Vector2.new(0.5, 1), UDim2.new(0.5, 0, 1, 0))   -- BOTTOM, apex DOWN
+        arrow(-90, Vector2.new(0, 0.5), UDim2.new(0, 0, 0.5, 0))   -- LEFT, apex LEFT
+        arrow(90,  Vector2.new(1, 0.5), UDim2.new(1, 0, 0.5, 0))   -- RIGHT, apex RIGHT
+        St.lockOnMarker = bb
+        return
+    end
+    -- Console-style chevron reticle: each arrowhead is a "^" (two strokes, NO bottom line) built
+    -- from rotated bars, so it renders identically on every executor (zero font/glyph dependency).
+    -- Dark demonic red with a red glow edge; apexes point OUTWARD around the target.
+    local CH_FILL = Color3.fromRGB(130, 0, 0)
+    local CH_GLOW = Color3.fromRGB(225, 40, 40)
+    local function chevron(rot, anchor, pos)
+        local holder = Instance.new("Frame")
+        holder.BackgroundTransparency = 1
+        holder.Size = UDim2.new(0, 30, 0, 22)
+        holder.AnchorPoint = anchor
+        holder.Position = pos
+        holder.Rotation = rot
+        holder.Parent = bb
+        local function stroke(strokeRot, xoff)
+            local b = Instance.new("Frame")
+            b.AnchorPoint = Vector2.new(0.5, 0.5)
+            b.Position = UDim2.new(0.5, xoff, 0.5, 0)
+            b.Size = UDim2.new(0, 6, 0, 20)
+            b.Rotation = strokeRot
+            b.BackgroundColor3 = CH_FILL
+            b.BorderSizePixel = 0
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 3)
+            c.Parent = b
+            local s = Instance.new("UIStroke")
+            s.Color = CH_GLOW
+            s.Thickness = 1.2
+            s.Transparency = 0.15
+            s.Parent = b
+            b.Parent = holder
+        end
+        stroke(34, -5)   -- left stroke  "/" rising to the apex
+        stroke(-34, 5)   -- right stroke "\\" falling from the apex
+    end
+    chevron(0,   Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 0))   -- TOP, apex UP
+    chevron(180, Vector2.new(0.5, 1), UDim2.new(0.5, 0, 1, 0))   -- BOTTOM, apex DOWN
+    chevron(-90, Vector2.new(0, 0.5), UDim2.new(0, 0, 0.5, 0))   -- LEFT, apex LEFT
+    chevron(90,  Vector2.new(1, 0.5), UDim2.new(1, 0, 0.5, 0))   -- RIGHT, apex RIGHT
+    St.lockOnMarker = bb
 end
 
 local function enableLockOn()
@@ -887,6 +1005,7 @@ local function enableLockOn()
 
         local targetCore = St.lockOnTarget.Core
         updateLockOnESP()
+        updateLockOnMarker()
         local base = math.clamp(Cfg.LockOn.Smoothness, 0.01, 1)
         -- Frame-rate-independent smoothing + an instant snap on the first frame of a
         -- fresh lock, so locking / switching targets faces them immediately instead
@@ -894,13 +1013,19 @@ local function enableLockOn()
         local alpha = firstFrame and 1 or math.clamp(1 - (1 - base) ^ (math.max(dt or 0, 0) * 60), 0, 1)
         firstFrame = false
 
-        -- Drive the CAMERA this frame for the "Camera" method, and ALSO during invisibility (where
-        -- you're frozen mid-animation and can't see/aim your own body).
-        local steerCam = (Cfg.LockOn.Method == "Camera") or St.invisActive
+        -- CONSOLE-style lock = do BOTH at once: steer the camera so the enemy stays framed (you
+        -- never have to drag your screen on mobile) AND rotate your body to face them (so hits
+        -- land). "Body" only turns you (you still drag the cam); "Camera" only moves the cam (body
+        -- never turns); "Console" combines them = true console aim-lock feel.
+        local method = Cfg.LockOn.Method
+        local rotateBody = (method == "Body") or (method == "Console")
+        -- Drive the CAMERA for "Camera"/"Console", and ALSO during invisibility (where you're
+        -- frozen mid-animation and can't see/aim your own body).
+        local steerCam = (method == "Camera") or (method == "Console") or St.invisActive
 
-        if Cfg.LockOn.Method ~= "Camera" then
-            -- Body method: rotate your HRP to face the target (runs during invis too -- the glitch
-            -- only displaces your rendered rig, not the HRP, so this makes you genuinely face the
+        if rotateBody then
+            -- rotate your HRP to face the target (runs during invis too -- the glitch only
+            -- displaces your rendered rig, not the HRP, so this makes you genuinely face the
             -- enemy and your hits land).
             myHum.AutoRotate = false
             local targetPos = Vector3.new(targetCore.Position.X, myHRP.Position.Y, targetCore.Position.Z)
@@ -1711,10 +1836,25 @@ do
         AutoBlockHoldFrames = 12,
         MeleeRange = 10,
         DashDetectRange = 25,
+        ProjectileRange = 80,
     }
 
     getgenv().userIsBlocking = false
     getgenv().blockState = { active = false, holdFrames = 0, cooldown = 0 }
+
+    -- Live framerate tracker (always running, cheap) for ping/fps-compensated block holds.
+    local lastFrameDt = 1/60
+    RunService.Heartbeat:Connect(function(dt) lastFrameDt = dt or lastFrameDt end)
+    -- Convert a hold length (defined in frames-at-60fps) into a real-time-constant frame count
+    -- for the CURRENT framerate, then extend it by your full round-trip ping so the block is
+    -- still up when the hit/dash/projectile actually registers on the server.
+    local function compHoldFrames(baseFrames60)
+        local p = 0
+        pcall(function() p = player:GetNetworkPing() end)
+        local fps = 1 / math.clamp(lastFrameDt, 1/240, 1/15)
+        local seconds = (baseFrames60 / 60) + (p * 2)
+        return math.clamp(math.ceil(seconds * fps), 3, 90)
+    end
 
     local M1_ANIMS = {
         ["rbxassetid://95295463826732"] = true,
@@ -1875,7 +2015,7 @@ do
 
         faceTarget(theirHRP)
         if St.autoBlockEnabled or St.autoPunishEnabled then
-            getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
+            getgenv().blockState.holdFrames = compHoldFrames(Config.AutoBlockHoldFrames)
             forceStartBlock()
         end
 
@@ -1883,59 +2023,334 @@ do
     end
 
     local projDebounce = {}
+    local trackedProjectiles = {}
+    local projThreatUntil = 0
+    local projFaceTarget = nil       -- the LIVE threat (incoming projectile or shooter) the block turns our TORSO to face, exactly like auto-block faces dashers. AutoRotate is NEVER touched, so we never snap back to the original direction.
+    local PROJ_PULSE = 0.20          -- seconds the guard is held per imminent projectile: one quick block, then back to neutral
+    local PROJ_TRIGGER_LEAD = 0.0    -- no extra base lead: engagement now rides purely on the ping+frame latency floor, so it commits ~15 studs closer than before (this is about as tight as it can get and still land in time)
+    local POINT_BLANK_DIST = 5       -- studs: close-range guaranteed-block bubble, tightened from 20 -> 5 so it no longer engages from way out (timing be damned only when right on top of us)
+    local HIT_RADIUS = 8             -- studs: how close the projectile's PREDICTED CLOSEST PASS must come to our body to count as aimed at us. Tightened 14 -> 8 so shots flying PAST us don't trigger a block ("only block what's actually heading into me")
+    local PROJ_ASSUMED_SPEED = 150   -- studs/s fallback, used only to estimate time-to-impact from a launch CFrame
+    local PROJ_LOOKAHEAD = 2.0       -- seconds: outer time horizon for trajectory lookahead (bumped 1.2 -> 2.0 to cover slower/longer-range projectiles; geometry still gates everything)
+    local PING_SLACK_CAP = 16        -- studs: max extra on-course radius added to absorb ping/lag position error. Tightened 30 -> 16 so the body-corridor stays tight and it won't block shots that aren't genuinely coming at us
+
+    -- EARLIEST-possible projectile detection. Returns whether a projectile launched from
+    -- `origin` travelling along `dir` will pass within HIT_RADIUS of us, plus an estimated
+    -- time-to-impact. This evaluates on the projectile's LAUNCH frame (the moment the Fire/
+    -- Interp effect replicates) instead of waiting for the part to physically get close --
+    -- that is what removes the "blocks at the last millisecond" delay. It uses closest-point-
+    -- on-ray geometry, so a projectile aimed slightly off (because you're strafing) is still
+    -- caught as long as its path passes near you.
+    local function trajectoryHitsUs(origin, dir, myPos, speed)
+        if typeof(origin) ~= "Vector3" or typeof(dir) ~= "Vector3" or dir.Magnitude < 0.01 then return false, 0 end
+        dir = dir.Unit
+        local toMe = myPos - origin
+        local along = toMe:Dot(dir)
+        if along < -5 then return false, 0 end            -- launched away from us
+        local perp = (toMe - dir * math.max(along, 0)).Magnitude
+        if perp > HIT_RADIUS then return false, 0 end      -- path will miss us
+        local tti = (speed and speed > 1) and (math.max(along, 0) / speed) or 0
+        return true, tti
+    end
+
+    -- RELATIVE-velocity collision predictor -- the core of adaptive blocking. It tests whether a
+    -- projectile (at projPos moving projVel) and US (at myPos moving myVel) are on a collision
+    -- course, accounting for OUR OWN movement. A shot fired at where we *were* still counts as a
+    -- hit when we're running into its path; a shot we're outrunning correctly does NOT. It returns
+    -- the predicted time-to-impact so we engage as soon as a hit is foreseen (up to PROJ_LOOKAHEAD
+    -- seconds early) instead of when the part is already on top of us. Current `ping` widens the
+    -- effective hit radius to absorb lag-induced position error, so high-latency shots still catch.
+    local function willCollide(projPos, projVel, myPos, myVel)
+        if typeof(projPos) ~= "Vector3" or typeof(projVel) ~= "Vector3" then return false, 0 end
+        myVel = (typeof(myVel) == "Vector3") and myVel or Vector3.zero
+        local rv = projVel - myVel               -- projectile velocity RELATIVE to us
+        local rvMag2 = rv:Dot(rv)
+        if rvMag2 < 9 then return false, 0 end    -- <3 studs/s relative closing speed: not a real threat
+        local rp = myPos - projPos                -- vector from projectile to us
+        local t = rp:Dot(rv) / rvMag2             -- time of closest approach (relative motion)
+        if t < 0 then return false, 0 end         -- closest approach already behind us -> moving apart
+        if t > PROJ_LOOKAHEAD then return false, 0 end
+        local closest = (rp - rv * t).Magnitude   -- miss distance at the moment of closest approach
+        local relSpeed = math.sqrt(rvMag2)
+        local radius = HIT_RADIUS + math.min(relSpeed * (ping or 0), PING_SLACK_CAP)
+        if closest > radius then return false, 0 end
+        return true, t
+    end
+
+    -- Per-frame re-check: returns true while ANY projectile we've detected is still in
+    -- flight toward us. The sustain loop calls this every frame so the block is never
+    -- dropped between overlapping projectiles -- it stays up until the threat clears, and
+    -- prunes parts once they pass us, veer off, or despawn.
+    -- Per-frame projectile servicer. Tracks each projectile's REAL velocity (manual position delta,
+    -- so it works for CFrame-animated parts whose engine .Velocity reads 0) and, the moment one
+    -- becomes IMMINENT and is on a collision course with us (given our own movement), fires ONE
+    -- short block pulse for it. Each projectile pulses at most once, so the rhythm is:
+    --   neutral -> projectile gets close -> instant block -> ~PROJ_PULSE later neutral again ->
+    --   next projectile -> instant block again.
+    -- Nothing is blocked while a projectile is still far away (no pre-blocking).
+    -- Returns true if ANY currently-tracked projectile is still on a live collision
+    -- course with us. Called every frame from the sustain heartbeat so the block
+    -- stays up the ENTIRE time a threat is in flight — not just for PROJ_PULSE seconds.
+    -- This is the fix for bug 2: the old code set projThreatUntil once on detection
+    -- and let it expire even while the part was still heading at us. Now we re-extend
+    -- every frame the geometry says it's still a hit, and drop the instant it's not.
+    local function serviceProjectiles(myPos, myVel)
+        local now      = os.clock()
+        local anyLive  = false
+        myVel          = (typeof(myVel) == "Vector3") and myVel or Vector3.zero
+        local frameDt  = math.clamp(lastFrameDt or (1/60), 1/240, 1/20)
+
+        for part, data in pairs(trackedProjectiles) do
+            if typeof(part) ~= "Instance" or not part.Parent then
+                trackedProjectiles[part] = nil
+            elseif now - data.addedAt > 6 then          -- bumped 4->6 for slow long-range balls
+                trackedProjectiles[part] = nil
+            else
+                local pos = part.Position
+                local dt  = now - data.lastT
+                local vel = (dt > 1e-4) and ((pos - data.lastPos) / dt) or Vector3.zero
+                data.lastPos = pos
+                data.lastT   = now
+                if vel.Magnitude < 1 then
+                    local pv = part.AssemblyLinearVelocity
+                    if pv.Magnitude >= 1 then vel = pv end
+                end
+                local dist = (pos - myPos).Magnitude
+                if dist > 320 then                       -- bumped 260->320 for long-range maps
+                    trackedProjectiles[part] = nil
+                elseif vel.Magnitude >= 5 then
+                    local rv     = vel - myVel
+                    local rvMag2 = rv:Dot(rv)
+                    if rvMag2 >= 4 then
+                        local rp      = myPos - pos
+                        local t       = rp:Dot(rv) / rvMag2
+                        local closest = (t <= 0) and rp.Magnitude or (rp - rv * t).Magnitude
+                        local relSpeed = math.sqrt(rvMag2)
+                        local hardR   = HIT_RADIUS + math.min(relSpeed * (ping or 0), PING_SLACK_CAP)
+                        local approaching = t >= -frameDt
+
+                        if approaching and closest <= hardR and t <= PROJ_LOOKAHEAD then
+                            -- Projectile is confirmed on a collision course heading at us.
+                            -- Fire and sustain the block for EVERY frame this stays true —
+                            -- no triggerLead gate, no premature unblock mid-flight.
+                            anyLive        = true
+                            projFaceTarget = part
+                            -- Extend by one frame + full ping each pass so the block never
+                            -- drops between frames while the ball is still in flight.
+                            local extendBy = frameDt + math.clamp((ping or 0), 0, 0.30)
+                            projThreatUntil = math.max(projThreatUntil, now + extendBy)
+                            if getgenv().blockState.cooldown > 0 then
+                                getgenv().blockState.cooldown = 0
+                            end
+                            if not getgenv().blockState.active then forceStartBlock() end
+                        end
+                    end
+                end
+            end
+        end
+        return anyLive
+    end
+
+    -- ── PROJECTILE CAST ANIMATION DETECTION ──────────────────────────────────
+    -- Live MCP trace confirmed Hakari's 7 anim IDs (UV9 table in KnitStart).
+    -- MeiMei controller is bytecode-protected so we use service-name detection instead.
+    --
+    -- Core idea: detect the CAST ANIMATION on the attacker the moment they start
+    -- the move, before the projectile even leaves their hand. Range-check is on the
+    -- ATTACKER's distance (not the projectile's) so we never block someone firing
+    -- across the map at someone else. The block fires at animation-start speed —
+    -- same frame as AnimationPlayed fires on the Animator — matching the exact
+    -- latency of the existing M1 autoblock which also runs on AnimationPlayed.
+    --
+    -- Per-move range table (studs): how far out each kit's projectile actually reaches.
+    -- Attacker must be within this range for us to bother blocking.
+    -- Tighter than Config.ProjectileRange (80) because short-range moves (snap, bird)
+    -- don't need 80 studs of detection — that was causing false blocks.
+    local PROJ_CAST_RANGES = {
+        -- Hakari — Reserve Ball (snap): detection range bumped 55 -> 70 studs.
+        ["rbxassetid://17207807777"] = 70,  -- Hakari cast 1
+        ["rbxassetid://17207806991"] = 70,  -- Hakari cast 2
+        ["rbxassetid://17207806413"] = 70,  -- Hakari cast 3
+        ["rbxassetid://17207805758"] = 70,  -- Hakari cast 4
+        ["rbxassetid://17207805299"] = 70,  -- Hakari cast 5
+        ["rbxassetid://17207804676"] = 70,  -- Hakari cast 6
+        ["rbxassetid://17207804009"] = 70,  -- Hakari cast 7
+    }
+
+    -- Services whose Effects event means a projectile was CAST (not just flying).
+    -- On these, we detect the ATTACKER and immediately face+block if in range.
+    -- Range is per-service below. These are the "always cast = always dangerous" services.
+    local CAST_SERVICES = {
+        ReserveBallService    = 70,   -- Hakari ball — travels full map, detect at 70
+        BirdControlService    = 65,
+        MurmurateService      = 55,
+        CirclingService       = 55,
+        LapseBlueService      = 75,
+        LapseBlueMaxService   = 75,
+        HollowPurpleService   = 80,
+        KamehamehaService     = 75,
+        PiercingBloodService  = 70,
+        FlameArrowService     = 60,
+        FurnaceArrowService   = 60,
+        MiracleCannonService  = 65,
+        UltraCannonService    = 70,
+        GraniteBlastService   = 55,
+        PigeonViolaService    = 60,
+        PlasmaWaveService     = 65,
+        EnergyRippleService   = 60,
+    }
+
+    local castDebounce = {}  -- [enemyChar] = expiry time
+
+    -- Core cast-detect trigger: called at animation-start speed.
+    -- Two gates before blocking:
+    --   1. Range: attacker within the move's effective range
+    --   2. FACING DOT: attacker's HRP.LookVector must point toward us (dot > 0.35)
+    --      This is the fix for bug 1 — someone casting next to you at someone else
+    --      has their LookVector pointing AWAY from you, so dot < 0.35 → skip.
+    --      0.35 = ~70° cone, wide enough for angled shots, rejects sideways/away casts.
+    local FACING_DOT_MIN = 0.35  -- (retained; superseded by the AIM_RADIUS gate below)
+    -- Absolute aim radius (studs): the attacker's aim line (their LookVector = the
+    -- direction the projectile travels) must pass within this distance of our body.
+    -- Unlike an angular cone, this does NOT blow up at long range — a far attacker
+    -- whose shot would miss us by ~30 studs no longer triggers a block. This is the
+    -- "only block if it's actually aimed at / coming into my radius" gate.
+    local AIM_RADIUS = 12
+
+    local function onCastDetected(attackerChar, range)
+        if not St.autoProjBlockEnabled and not St.autoBlockEnabled and not St.autoPunishEnabled then return end
+        local myChar = player.Character
+        if not myChar or attackerChar == myChar then return end
+        if myChar:GetAttribute("Ragdoll") ~= 0 then return end
+        local myHRP = myChar:FindFirstChild("HumanoidRootPart")
+        if not myHRP then return end
+        local theirHRP = attackerChar:FindFirstChild("HumanoidRootPart")
+        if not theirHRP then return end
+
+        local myPos    = myHRP.Position
+        local theirPos = theirHRP.Position
+        local dist     = (theirPos - myPos).Magnitude
+
+        -- Gate 1: range
+        if dist > range then return end
+
+        -- Gate 2: AIM-RAY RADIUS — is the shot actually coming into my body, or just
+        -- happening near me? Project our position onto the attacker's aim line (their
+        -- LookVector, the direction the projectile flies). Require:
+        --   (a) we're IN FRONT of them along that line (along > 0), and
+        --   (b) the line passes within AIM_RADIUS studs of us (absolute, not angular).
+        -- This kills the "blocks from far when not actually aimed at me" case: an
+        -- angular cone covers a huge area at long range, an absolute radius does not.
+        -- If a homing/curving shot slips past this, serviceProjectiles still catches it
+        -- in-flight once it's genuinely approaching, so we never miss a real threat.
+        local toMe   = (myPos - theirPos)
+        if toMe.Magnitude > 0.1 then
+            local aimDir = theirHRP.CFrame.LookVector
+            local along  = toMe:Dot(aimDir)
+            if along <= 0 then return end                      -- aiming away from us
+            local closestPt = theirPos + aimDir * along
+            local aimMiss   = (myPos - closestPt).Magnitude
+            if aimMiss > AIM_RADIUS then return end             -- shot passes too wide of us
+        end
+
+        -- Debounce per attacker (0.6s window)
+        local now = os.clock()
+        if castDebounce[attackerChar] and castDebounce[attackerChar] > now then return end
+        castDebounce[attackerChar] = now + 0.6
+
+        -- Face the ATTACKER (not the projectile) — instant, same frame
+        projFaceTarget = theirHRP
+        -- Travel-time hold: how long until the projectile realistically reaches us.
+        -- (dist / speed) + 2*ping accounts for launch delay + server round-trip.
+        -- Minimum is PROJ_PULSE so close-range casts still get a full short hold.
+        -- Maximum is 2.5s so a cast aimed somewhere else doesn't lock us for ages.
+        local travelTime  = dist / PROJ_ASSUMED_SPEED
+        local holdDur     = math.clamp(travelTime + (ping or 0) * 2 + 0.15, PROJ_PULSE, 2.5)
+        projThreatUntil   = math.max(projThreatUntil, now + holdDur)
+        if getgenv().blockState.cooldown > 0 then getgenv().blockState.cooldown = 0 end
+        if not getgenv().blockState.active then forceStartBlock() end
+    end
+
+    -- Helper: find the character model that owns a given instance (Part, Player, Model)
+    local function resolveChar(arg)
+        if typeof(arg) ~= "Instance" then return nil end
+        if arg:IsA("Model") and arg:FindFirstChildOfClass("Humanoid") then return arg end
+        local anc = arg:FindFirstAncestorOfClass("Model")
+        if anc and anc:FindFirstChildOfClass("Humanoid") then return anc end
+        if arg:IsA("Player") then return arg.Character end
+        local plr = Players:GetPlayerFromCharacter(arg)
+        return plr and plr.Character or nil
+    end
 
     local function onProjectileFire(attacker, projCFrame)
-        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
+        -- onProjectileFire is now a FALLBACK for Fire events not covered by cast-detect.
+        -- It uses the same willCollide geometry but with a tighter range gate.
+        if not St.autoBlockEnabled and not St.autoPunishEnabled and not St.autoProjBlockEnabled then return end
         if typeof(attacker) ~= "Instance" or not attacker:IsA("Model") then return end
         if attacker == player.Character then return end
         local myChar = player.Character
         if not myChar then return end
         local myHRP = myChar:FindFirstChild("HumanoidRootPart")
+        if not myHRP then return end
+        local myPos = myHRP.Position
         local theirHRP = attacker:FindFirstChild("HumanoidRootPart")
-        if not myHRP or not theirHRP then return end
-        if (theirHRP.Position - myHRP.Position).Magnitude > 200 then return end
-
-        if typeof(projCFrame) == "CFrame" then
-            local dot = projCFrame.LookVector:Dot((myHRP.Position - projCFrame.Position).Unit)
-            if dot < 0.7 then return end
-        end
-
+        if theirHRP and (theirHRP.Position - myPos).Magnitude > Config.ProjectileRange then return end
+        if typeof(projCFrame) ~= "CFrame" then return end
+        local myVel = myHRP.AssemblyLinearVelocity
+        local projVel = projCFrame.LookVector.Unit * PROJ_ASSUMED_SPEED
+        local hit, t = willCollide(projCFrame.Position, projVel, myPos, myVel)
+        if not hit then return end
+        local triggerLead = math.clamp((ping or 0) + PROJ_TRIGGER_LEAD, 0.0, 0.32)
+        local launchDist = (projCFrame.Position - myPos).Magnitude
+        if t > triggerLead and launchDist > POINT_BLANK_DIST then return end
         if projDebounce[attacker] then return end
         projDebounce[attacker] = true
-        task.delay(0.5, function() projDebounce[attacker] = nil end)
-
-        faceTarget(theirHRP)
-        getgenv().blockState.holdFrames = 30
-        forceStartBlock()
+        task.delay(0.12, function() projDebounce[attacker] = nil end)
+        if theirHRP then projFaceTarget = theirHRP end
+        projThreatUntil = math.max(projThreatUntil, os.clock() + math.clamp(PROJ_PULSE + (ping or 0), PROJ_PULSE, 0.40))
+        if getgenv().blockState.cooldown > 0 then getgenv().blockState.cooldown = 0 end
+        if not getgenv().blockState.active then forceStartBlock() end
     end
 
+    -- Wire up CAST-SERVICE detection: fires the instant the Effects remote replicates
+    -- (= same frame the server processes the move activation, before the projectile spawns).
     for _, svc in ipairs(Knit.Services:GetChildren()) do
+        local svcName = svc.Name
+        local castRange = CAST_SERVICES[svcName]
         local re = svc:FindFirstChild("RE")
         if re then
             local eff = re:FindFirstChild("Effects")
             if eff and (eff:IsA("RemoteEvent") or eff:IsA("UnreliableRemoteEvent")) then
                 pcall(function()
                     eff.OnClientEvent:Connect(function(effectType, arg2, arg3)
-                        if not St.autoBlockEnabled and not St.autoPunishEnabled then return end
+                        if not St.autoBlockEnabled and not St.autoPunishEnabled and not St.autoProjBlockEnabled then return end
                         if type(effectType) ~= "string" then return end
+
+                        -- CAST-SERVICE: any event from a projectile-exclusive service
+                        -- = the move just fired, block immediately if attacker in range.
+                        if castRange then
+                            local attChar = resolveChar(arg2)
+                            if attChar then onCastDetected(attChar, castRange) end
+                            return  -- don't fall through to Fire/Interp for these
+                        end
+
+                        -- GENERIC services: keep existing Fire/Interp/Swing handling
                         if effectType == "Swing" or effectType == "Swing2" then
                             onM1(arg2)
                         elseif effectType == "Fire" then
                             onProjectileFire(arg2, arg3)
                         elseif effectType == "Interp" then
                             if typeof(arg2) == "Instance" and arg2:IsA("BasePart") then
+                                if not (St.autoBlockEnabled or St.autoPunishEnabled or St.autoProjBlockEnabled) then return end
                                 local myChar = player.Character
                                 if not myChar then return end
                                 local myHRP = myChar:FindFirstChild("HumanoidRootPart")
                                 if not myHRP then return end
-                                local toMe = (myHRP.Position - arg2.Position)
-                                local vel = arg2.Velocity
-                                if vel.Magnitude < 1 then return end
-                                if vel.Unit:Dot(toMe.Unit) > 0.85 and toMe.Magnitude < 150 then
-                                    if (St.autoBlockEnabled or St.autoPunishEnabled) and not getgenv().blockState.active then
-                                        getgenv().blockState.holdFrames = 20
-                                        forceStartBlock()
-                                    end
+                                local myPos = myHRP.Position
+                                if (myPos - arg2.Position).Magnitude > 220 then return end
+                                local now = os.clock()
+                                if not trackedProjectiles[arg2] then
+                                    trackedProjectiles[arg2] = { addedAt = now, lastPos = arg2.Position, lastT = now, pulsed = false }
                                 end
                             end
                         end
@@ -1976,15 +2391,39 @@ do
             if not theirHRP or not hum then continue end
 
             local dist = (theirHRP.Position - myHRP.Position).Magnitude
-            if dist > Config.MeleeRange then continue end
 
             for _, track in ipairs(hum:GetPlayingAnimationTracks()) do
                 local id = track.Animation.AnimationId
+                local castRange = PROJ_CAST_RANGES[id]
+
+                -- ── CAST ANIMATION DETECTION ──────────────────────────────
+                -- If this animation ID is a known projectile cast, trigger
+                -- immediately at animation-start. No waiting for the projectile
+                -- to travel. Range gate is per-move so a Hakari snap only
+                -- triggers when they're within 55 studs, not 80.
+                -- Gated on St.autoProjBlockEnabled (independent of autoBlock).
+                if castRange and St.autoProjBlockEnabled and dist <= castRange then
+                    if track.Length <= 0 then
+                        -- do nothing, no valid length
+                    else
+                        local key = tostring(enemyChar) .. id .. "_cast"
+                        if not animDebounce[key] then
+                            animDebounce[key] = true
+                            task.delay(math.max(track.Length, 0.5), function() animDebounce[key] = nil end)
+                            -- Face + block instantly (animation-start speed)
+                            onCastDetected(enemyChar, castRange)
+                        end
+                    end
+                end
+
+                -- ── EXISTING M1 DETECTION (unchanged) ─────────────────────
                 if not M1_ANIMS[id] then continue end
                 if track.Length <= 0 then continue end
 
                 local pingThreshold = math.clamp(1 - ping * 0.7, 0.15, 0.95)
                 local pct = track.TimePosition / track.Length
+
+                if dist > Config.MeleeRange then continue end  -- M1s only at melee range
 
                 if pct < pingThreshold then
                     local key = tostring(enemyChar) .. id
@@ -1994,7 +2433,7 @@ do
 
                     faceTarget(theirHRP)
                     if St.autoBlockEnabled or St.autoPunishEnabled then
-                        getgenv().blockState.holdFrames = Config.AutoBlockHoldFrames
+                        getgenv().blockState.holdFrames = compHoldFrames(Config.AutoBlockHoldFrames)
                         forceStartBlock()
                     end
 
@@ -2007,7 +2446,7 @@ do
     local enemyData = {}
 
     RunService.Heartbeat:Connect(function()
-        if not St.autoBlockEnabled and not St.autoPunishEnabled then
+        if not St.autoBlockEnabled and not St.autoPunishEnabled and not St.autoProjBlockEnabled then
             if getgenv().blockState.active then forceStopBlock() end
             return
         end
@@ -2029,7 +2468,19 @@ do
             shouldBlock = true
         end
 
-        if not shouldBlock then
+        -- Reactive projectile blocking: serviceProjectiles re-checks collision geometry
+        -- EVERY frame and extends projThreatUntil by one frame while any tracked part
+        -- is still on a live collision course. The block sustains for EXACTLY as long
+        -- as something is heading at us — no fixed timer, no premature drop, no gap
+        -- between overlapping projectiles. anyLive = true means ≥1 tracked part is
+        -- still incoming; the moment none are, projThreatUntil stops being extended
+        -- and the block drops naturally after the last ping-slack frame.
+        local anyLive = serviceProjectiles(hrp.Position, hrp.AssemblyLinearVelocity)
+        if os.clock() < projThreatUntil or anyLive then
+            shouldBlock = true
+        end
+
+        if not shouldBlock and (St.autoBlockEnabled or St.autoPunishEnabled) then
             local enemies = {}
             for _, p in ipairs(Players:GetPlayers()) do
                 if p ~= player and p.Character then table.insert(enemies, p.Character) end
@@ -2069,39 +2520,49 @@ do
                     data.dashCooldown -= 1
                 end
 
-                if accel > 25 and speedToward > 20 and dist < 15 and data.dashCooldown <= 0 then
+                if accel > 18 and speedToward > 16 and dist < Config.DashDetectRange and data.dashCooldown <= 0 then
                     shouldBlock = true
-                    data.dashCooldown = 30
+                    getgenv().blockState.holdFrames = compHoldFrames(14)
+                    data.dashCooldown = 24
                     break
                 end
 
-                if speedToward > 50 and dist < 12 and data.dashCooldown <= 0 then
+                if speedToward > 45 and dist < Config.DashDetectRange and data.dashCooldown <= 0 then
                     shouldBlock = true
-                    data.dashCooldown = 20
+                    getgenv().blockState.holdFrames = compHoldFrames(14)
+                    data.dashCooldown = 18
                     break
                 end
             end
         end
 
         if shouldBlock then
-            local closestEnemy = nil
-            local closestDist = math.huge
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= player and p.Character then
-                    local ohrp = p.Character:FindFirstChild("HumanoidRootPart")
-                    if ohrp then
-                        local d = (ohrp.Position - hrp.Position).Magnitude
-                        if d < closestDist and d < 30 then
-                            closestDist = d
-                            closestEnemy = ohrp
+            -- Face the threat the SAME way the auto-block faces dashers: rotate the TORSO to look at it.
+            -- AutoRotate is NEVER touched, so the character does NOT snap back to its original direction.
+            -- While a projectile pulse is live we face the ACTUAL incoming projectile (from ANY direction,
+            -- including directly behind); otherwise we face the nearest enemy (dash / melee).
+            local faceObj = nil
+            if os.clock() < projThreatUntil and typeof(projFaceTarget) == "Instance" and projFaceTarget.Parent then
+                faceObj = projFaceTarget
+            else
+                local closestDist = math.huge
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= player and p.Character then
+                        local ohrp = p.Character:FindFirstChild("HumanoidRootPart")
+                        if ohrp then
+                            local d = (ohrp.Position - hrp.Position).Magnitude
+                            if d < closestDist and d < 30 then
+                                closestDist = d
+                                faceObj = ohrp
+                            end
                         end
                     end
                 end
             end
-            if closestEnemy then
+            if faceObj then
                 local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
                 if torso then
-                    local dir = (closestEnemy.Position - hrp.Position) * Vector3.new(1, 0, 1)
+                    local dir = (faceObj.Position - hrp.Position) * Vector3.new(1, 0, 1)
                     if dir.Magnitude > 0.5 then
                         torso.CFrame = CFrame.lookAt(torso.Position, torso.Position + dir.Unit)
                     end
@@ -2110,8 +2571,12 @@ do
         end
 
         if shouldBlock then
+            -- Clear the post-release cooldown the instant we need to block again, so the NEXT
+            -- projectile re-engages with zero dead frames: quick detect -> block -> release -> repeat.
+            if getgenv().blockState.cooldown > 0 then getgenv().blockState.cooldown = 0 end
             startBlock()
         else
+            -- No live threat -> drop the guard immediately. We do NOT sit on the block.
             forceStopBlock()
         end
     end)
@@ -3340,7 +3805,7 @@ local LockOnSection = Tabs.Combat:AddSection("Lock-On System")
 Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, aim your camera so the enemy is near the middle of your screen, then press the LOCK ON button to lock onto them. Aim at someone else and press again to switch, or press while aiming at your current target (or at empty space) to unlock."})
 
 Tabs.Combat:AddToggle("TglLockOn", {
-    Title="Lock-On Enable (Mobile)", 
+    Title="Lock-On Enable", 
     Default=false, 
     Callback=function(v) 
         St.lockOnEnabled = v 
@@ -3353,10 +3818,10 @@ Tabs.Combat:AddToggle("TglLockOn", {
         end 
     end
 })
-Tabs.Combat:AddDropdown("DpLockOnMethod", {Title="Lock-On Method", Values={"Body", "Camera"}, Default="Body", Callback=function(v) Cfg.LockOn.Method = v end})
+Tabs.Combat:AddDropdown("DpLockOnMethod", {Title="Lock-On Method", Values={"Body", "Camera", "Console"}, Default="Console", Callback=function(v) Cfg.LockOn.Method = v end})
+Tabs.Combat:AddToggle("TglLockOnESP", {Title="Lock-On ESP (see target through walls)", Default=false, Callback=function(v) Cfg.LockOn.ESP = v; if not v then clearLockOnESP() end end})
 Tabs.Combat:AddSlider("SldLockOnSmooth", {Title="Lock-On Smoothness", Min=0.01, Max=1, Default=0.15, Rounding=2, Callback=function(v) Cfg.LockOn.Smoothness = v end})
 Tabs.Combat:AddSlider("SldLockOnDist", {Title="Max Distance", Min=10, Max=250, Default=150, Rounding=0, Callback=function(v) Cfg.LockOn.MaxDistance = v end})
-Tabs.Combat:AddToggle("TglLockOnESP", {Title="Lock-On ESP (see target through walls)", Default=true, Callback=function(v) Cfg.LockOn.ESP = v; if not v then clearLockOnESP() end end})
 Tabs.Combat:AddDropdown("DpLockOnTarget", {Title="Lock Target (player / dummy)", Values={"(press Refresh)"}, Default=1, Callback=function(v) end})
 Tabs.Combat:AddButton({Title="Refresh Lock Targets", Callback=function()
     local t = getValidTargets(LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
@@ -3601,6 +4066,7 @@ Tabs.Extras:AddButton({Title="Hitbox Extender", Callback=function()
 end})
 
 Tabs.Extras:AddToggle("TglAutoBlock", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v) St.autoBlockEnabled = v if v then notify("Auto Block", "Auto Block + Dash Predict enabled.", 2) else if _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Block", "Disabled.", 2) end end})
+Tabs.Extras:AddToggle("TglAutoProjBlock", {Title="Auto Projectile Block", Default=false, Callback=function(v) St.autoProjBlockEnabled = v if v then notify("Auto Projectile Block", "ON - instantly blocks incoming projectiles within range (ping/fps compensated).", 3) else if not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Projectile Block", "Disabled.", 2) end end})
 Tabs.Extras:AddToggle("TglAutoPunish", {Title="Auto Punish", Default=false, Callback=function(v) St.autoPunishEnabled = v notify("Auto Punish", v and "Enabled - auto-M1 after a successful block." or "Disabled.", 2) end})
 Tabs.Extras:AddToggle("TglAutoBlockBreak", {Title="Auto Block Break", Default=false, Callback=function(v) St.autoBlockBreakEnabled = v notify("Auto Block Break", v and "Enabled - dash behind blockers when you M1." or "Disabled.", 2) end})
 Tabs.Extras:AddToggle("TglAntiAFK", {Title="Anti-AFK", Default=false, Callback=function(v) St.antiAfkEnabled = v if v then notify("Anti-AFK", "Enabled.", 2) end end})
