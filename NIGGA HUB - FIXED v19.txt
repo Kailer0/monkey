@@ -134,13 +134,16 @@ local St = {
     harutaBackstabEnabled = false,
     bfChainBtnEnabled = false,
     harutaBsBtnEnabled = false,
+    autoWorldSlashEnabled = false, autoFrogVariantEnabled = false, autoEarthquakeEnabled = false, autoShutUpEnabled = false, itemEspEnabled = false,
+    flashStepM1Enabled = false, flashStepM1Range = 20,
+    autoCounterEnabled = false, autoCounterRange = 22, autoCounterBusy = false, autoCounterCooldown = 0,
     bfLastAttackTime = {}, bfTargetLookSmoothed = {}, bfPrevTargetPos = {}, bfPrevTargetTime = {},
-    StatusParagraph = nil, invisAnimTrack = nil,
+    StatusParagraph = nil, invisAnimTrack = nil, invisCamAnchor = nil, invisPrevCamSubject = nil,
 }
 
 local Cn = {
     noclipConn = nil, invisCharConn = nil, shrinkCharConn = nil, noDashCooldownConn = nil, wallhopConn2 = nil, bfHeartbeatConn = nil, bfCharConn = nil, bfPlayerAddedConn = nil, bfPlayerRemovingConn = nil, bfAttackConns = {}, 
-    flyConnection = nil, nanamiRatioConn = nil, qteGuiAddedConn = nil, yonkCharConn = nil, dashMultCharConn = nil, lockOnConn = nil, attachLoopConn = nil, todoAnimConn = nil,
+    flyConnection = nil, nanamiRatioConn = nil, qteGuiAddedConn = nil, yonkCharConn = nil, dashMultCharConn = nil, lockOnConn = nil, attachLoopConn = nil, todoAnimConn = nil, autoCounterConn = nil, autoCounterAnimConn = nil,
 }
 
 local Keys = {
@@ -617,33 +620,9 @@ local function runHunt()
 end
 
 local function stopHunt()
-    -- Pressing Stop Hunt while the AC-bypass reset loop is already running cancels everything.
-    if St.acBypassHunting then
-        St.acBypassHunting = false; St.huntRunning = false
-        notify("Stop Hunt","Stopped. No more resets.",3); return
-    end
-    -- Stop the lucky-cycle hunt, then KEEP force-resetting until the anti-cheat is bypassed.
     St.huntRunning = false
-    St.acBypassHunting = true
-    task.spawn(function()
-        notify("Stop Hunt","Cycle hunt stopped. Resetting until AC is bypassed... (press Stop Hunt again to cancel)",5)
-        task.wait(0.3) -- let the cycle-hunt loop unwind first so we never double-reset
-        local attempts = 0
-        while St.acBypassHunting and attempts < Cfg.MAX_HUNT_ATTEMPTS do
-            attempts = attempts + 1
-            local ok = checkCycle()
-            if ok == true then
-                notify("AC BYPASSED","Bypass confirmed after "..attempts.." resets. You're clear.",6)
-                break
-            elseif ok == false then
-                if not St.acBypassHunting then break end
-                forceReset(); LocalPlayer.CharacterAdded:Wait(); task.wait(Cfg.RESPAWN_WAIT)
-            else
-                task.wait(0.5)
-            end
-        end
-        St.acBypassHunting = false
-    end)
+    St.acBypassHunting = false
+    notify("Hunt", "Stopped.", 3)
 end
 
 -- ============================================================
@@ -700,13 +679,75 @@ local function setupInvisForChar(char)
         track.TimePosition=Cfg.INVIS_FREEZE_TIME
         track:AdjustSpeed(0)
     end)
-    -- CLIENT-ONLY SELF-VIEW (v55): this invis glitch freezes you mid-animation and can drag your rig
-    -- (and sometimes the HRP) somewhere you can't see -- often UNDER the map -- so a plain part marker
-    -- ends up hidden right along with you. The fix: build our own little marker rig and put a Highlight
-    -- on it with DepthMode = AlwaysOnTop. An AlwaysOnTop highlight renders THROUGH the map, so you see
-    -- your glowing silhouette + a forward arrow no matter where the glitch parked you. It's parented to
-    -- the camera (client-only, never replicates, game scripts won't clean it up), so you're still 100%
-    -- invisible to everyone else.
+
+    -- CAMERA FIX (v56): The invis glitch freezes a mid-air animation pose which drags the HRP
+    -- underground on some clients. Roblox's camera follows CameraSubject (the Humanoid), whose
+    -- root is the HRP -- so the camera gets yanked underground too.
+    --
+    -- Previous attempt: switching CameraType/CameraSubject to a fixed anchor broke shiftlock
+    -- because shiftlock reads the Humanoid's orientation from the camera and expects CameraType
+    -- to stay Custom with the Humanoid as subject. Locking the subject to a static Part meant
+    -- the camera stopped updating with the player's facing direction => frozen shiftlock bug.
+    --
+    -- Correct solution: create a small INVISIBLE anchored Part (NH_CamAnchor) parented to
+    -- Workspace (not Camera) and set CameraSubject to IT. Every RenderStep we position it
+    -- at the HRP's XZ but clamp Y to >= (HRP.Y at activation time), so the camera always
+    -- orbits the above-ground hitbox position. CameraType stays Custom the whole time, so
+    -- shiftlock, free-cam, everything works normally -- the engine just orbits a different
+    -- subject that happens to track the correct position. On cleanup we restore CameraSubject
+    -- to the Humanoid. No Scriptable camera, no CFrame fighting, no shiftlock breakage.
+    pcall(function()
+        -- Clean up any previous anchor
+        if St.invisCamAnchor and St.invisCamAnchor.Parent then
+            St.invisCamAnchor:Destroy()
+        end
+        St.invisCamAnchor = nil
+
+        local cam = Workspace.CurrentCamera
+
+        -- Record the above-ground Y baseline at the moment invis activates.
+        -- This is the Y we want the camera to stay orbiting around.
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local baseY = hrp and hrp.Position.Y or 0
+
+        -- Build the invisible anchor part
+        local anchor = Instance.new("Part")
+        anchor.Name = "NH_CamAnchor"
+        anchor.Size = Vector3.new(0.1, 0.1, 0.1)
+        anchor.Anchored = true
+        anchor.CanCollide = false
+        anchor.CanQuery = false
+        anchor.CanTouch = false
+        anchor.Massless = true
+        anchor.Transparency = 1
+        anchor.CastShadow = false
+        anchor.Parent = Workspace  -- must be in Workspace, not Camera, for CameraSubject to work
+        St.invisCamAnchor = anchor
+
+        -- Save the old CameraSubject so we can restore it exactly on cleanup
+        St.invisPrevCamSubject = cam.CameraSubject
+
+        -- Hand the camera to our anchor. CameraType stays Custom so shiftlock is unaffected.
+        cam.CameraSubject = anchor
+
+        -- Every frame: keep the anchor glued to the HRP's real XZ position at the correct Y.
+        RunService:UnbindFromRenderStep("NH_InvisCamAnchor")
+        RunService:BindToRenderStep("NH_InvisCamAnchor", Enum.RenderPriority.Camera.Value - 1, function()
+            if not St.invisActive then return end
+            local c = LocalPlayer.Character
+            local h = c and c:FindFirstChild("HumanoidRootPart")
+            if not h then return end
+            -- Clamp Y: never let the anchor go below the baseline (underground).
+            -- If the HRP is legitimately above baseline (jumped etc.) follow it up.
+            local pos = h.Position
+            local clampedY = math.max(pos.Y, baseY)
+            anchor.CFrame = CFrame.new(pos.X, clampedY, pos.Z)
+        end)
+    end)
+
+    -- CLIENT-ONLY SELF-VIEW: build a glowing marker so you can see your own hitbox position
+    -- while invisible. AlwaysOnTop highlight punches through the map even if HRP went underground.
+    -- Parented to Camera so it's client-only and never replicates.
     pcall(function()
         if St.selfViewModel then St.selfViewModel:Destroy(); St.selfViewModel = nil end
         local function buildSelfView()
@@ -722,7 +763,6 @@ local function setupInvisForChar(char)
             nose.Material = Enum.Material.Neon; nose.Color = Color3.fromRGB(80, 255, 140); nose.Transparency = 0
             nose.Parent = m
             m.PrimaryPart = body
-            -- THE "highlite": AlwaysOnTop so it punches through the map even if you're under it
             local hl = Instance.new("Highlight")
             hl.Name = "NH_SelfHL"; hl.Adornee = m
             hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
@@ -737,7 +777,6 @@ local function setupInvisForChar(char)
         RunService:UnbindFromRenderStep("NH_SelfView")
         RunService:BindToRenderStep("NH_SelfView", Enum.RenderPriority.Camera.Value + 2, function()
             if not St.invisActive then return end
-            -- self-heal if the model got destroyed (respawn / executor GC / etc.)
             if not m or not m.Parent then
                 m, body, nose = buildSelfView()
                 St.selfViewModel = m
@@ -746,7 +785,41 @@ local function setupInvisForChar(char)
             local h = cc and cc:FindFirstChild("HumanoidRootPart")
             if not h then return end
             body.CFrame = h.CFrame
-            nose.CFrame = h.CFrame * CFrame.new(0, 0, -(nose.Size.Z / 2 + 0.6))  -- LookVector is -Z, arrow sits in FRONT of you
+            nose.CFrame = h.CFrame * CFrame.new(0, 0, -(nose.Size.Z / 2 + 0.6))
+        end)
+    end)
+
+    -- SHIFTLOCK FIX: With CameraSubject pointed at the anchor Part above, Roblox's built-in
+    -- shiftlock / first-person no longer rotates your character to face the camera (that logic
+    -- only rotates a Humanoid subject, and our subject is now a plain Part). We restore it
+    -- manually: while invisible AND the mouse is locked to center (shiftlock or first person),
+    -- face the HRP toward the camera's flat look direction every frame; when unlocked, hand
+    -- rotation back to the Humanoid (AutoRotate) so normal movement-facing still works.
+    pcall(function()
+        RunService:UnbindFromRenderStep("NH_InvisShiftlock")
+        RunService:BindToRenderStep("NH_InvisShiftlock", Enum.RenderPriority.Camera.Value + 3, function()
+            if not St.invisActive then return end
+            local c = LocalPlayer.Character
+            local h = c and c:FindFirstChild("HumanoidRootPart")
+            local hum = c and c:FindFirstChildWhichIsA("Humanoid")
+            if not h or not hum then return end
+            local locked = (UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter)
+            if locked then
+                -- Stop the Humanoid auto-rotating toward movement so it doesn't fight us.
+                if hum.AutoRotate then hum.AutoRotate = false end
+                local cam = Workspace.CurrentCamera
+                local look = cam and cam.CFrame.LookVector
+                if look then
+                    local flat = Vector3.new(look.X, 0, look.Z)
+                    if flat.Magnitude > 0.001 then
+                        local p = h.Position
+                        h.CFrame = CFrame.new(p, p + flat.Unit)
+                    end
+                end
+            else
+                -- Not locked: give facing control back to the Humanoid.
+                if not hum.AutoRotate then hum.AutoRotate = true end
+            end
         end)
     end)
 end
@@ -760,9 +833,43 @@ local function cleanupInvis(char)
         end)
         St.invisAnimTrack=nil
     end
+
+    -- Stop the camera anchor loop first, then restore CameraSubject to what it was before
+    -- (always the Humanoid in normal play). Destroying the anchor before restoring subject
+    -- would leave the camera briefly subjectless which can flicker -- restore first, destroy after.
+    pcall(function() RunService:UnbindFromRenderStep("NH_InvisCamAnchor") end)
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if cam then
+            if St.invisPrevCamSubject and St.invisPrevCamSubject.Parent then
+                cam.CameraSubject = St.invisPrevCamSubject
+            else
+                -- Fallback: point camera back at the Humanoid directly
+                local c = LocalPlayer.Character
+                local h = c and c:FindFirstChildOfClass("Humanoid")
+                if h then cam.CameraSubject = h end
+            end
+        end
+        St.invisPrevCamSubject = nil
+    end)
+    pcall(function()
+        if St.invisCamAnchor and St.invisCamAnchor.Parent then
+            St.invisCamAnchor:Destroy()
+        end
+        St.invisCamAnchor = nil
+    end)
+
     pcall(function() RunService:UnbindFromRenderStep("NH_SelfView") end)
     pcall(function()
         if St.selfViewModel then St.selfViewModel:Destroy(); St.selfViewModel = nil end
+    end)
+
+    -- Stop the manual shiftlock rotation and give facing control back to the Humanoid.
+    pcall(function() RunService:UnbindFromRenderStep("NH_InvisShiftlock") end)
+    pcall(function()
+        local c = LocalPlayer.Character
+        local hum = c and c:FindFirstChildWhichIsA("Humanoid")
+        if hum then hum.AutoRotate = true end
     end)
     if not char then return end
     local animateScript=char:FindFirstChild("Animate")
@@ -3389,38 +3496,30 @@ local function bfFireCharged(effTime, target, skipOrient)
         -- real Three key here (the ONLY input that reliably flashes), then immediately reset
         -- LastInputType back to Touch (robust corner touch) so the thumbstick survives.
         if mobile then
-            -- MOBILE: native game skill path. tc:UseKey(slot,"Activated"/"Deactivated") fires the
-            -- move with ZERO UIS keyboard events => LastInputType stays Touch => the joystick +
-            -- jump button are NEVER hidden. Proven joystick fix (confirmed via MCP source).
             local tc = nhGetToolController()
             if tc then
-                pcall(function() tc:UseKey(BF.KEY_NUM, "Activated") end)
+                local useKey = _G.NH_origUseKey or tc.UseKey
+                pcall(function() useKey(tc, BF.KEY_NUM, "Activated") end)
                 task.wait(BF.HOLD)
-                pcall(function() tc:UseKey(BF.KEY_NUM, "Deactivated") end)
+                pcall(function() useKey(tc, BF.KEY_NUM, "Deactivated") end)
             end
         else
             VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
             task.wait(BF.HOLD)
             VIM:SendKeyEvent(false, BF.MOVE_KEY, false, game)
         end
-        -- wait the golden inter-hit interval, precise at the end. Both platforms use the SAME
-        -- timing (effTime, ~0.26): the charge->release flash window is identical; only the INPUT
-        -- method differs (mobile = tc:UseKey, PC = VIM key). Matches the proven mobile script.
         local target_t = os.clock() + (effTime - BF.HOLD)
         while bfActive and (target_t - os.clock()) > BF.FINE_SPIN do
             RunService.Heartbeat:Wait()
         end
         while bfActive and os.clock() < target_t do end
-        -- HIT 2 (release the flash) -- the second precisely-timed press is what the
-        -- controller reads as a Black Flash and fires with the BF flag set.
-        -- HIT 2 (release the flash) -- the second precisely-timed key press is what the
-        -- controller reads as a Black Flash. Same input path as HIT 1 on each platform.
         if mobile then
             local tc = nhGetToolController()
             if tc then
-                pcall(function() tc:UseKey(BF.KEY_NUM, "Activated") end)
+                local useKey = _G.NH_origUseKey or tc.UseKey
+                pcall(function() useKey(tc, BF.KEY_NUM, "Activated") end)
                 task.wait(BF.HOLD)
-                pcall(function() tc:UseKey(BF.KEY_NUM, "Deactivated") end)
+                pcall(function() useKey(tc, BF.KEY_NUM, "Deactivated") end)
             end
         else
             VIM:SendKeyEvent(true, BF.MOVE_KEY, false, game)
@@ -3769,20 +3868,21 @@ do
     local function harutaBsFireMove()
         local ch = LocalPlayer.Character
         if not ch then return false end
-        if mobile then
-            local tc = nhGetToolController()
-            if tc then
-                pcall(function() tc:UseKey(2, "Activated") end)
-                task.wait(0.02)
-                pcall(function() tc:UseKey(2, "Deactivated") end)
-                return true
-            end
-        else
-            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Two, false, game)
+    if mobile then
+        local tc = nhGetToolController()
+        if tc then
+            local useKey = _G.NH_origUseKey or tc.UseKey
+            pcall(function() useKey(tc, 2, "Activated") end)
             task.wait(0.02)
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Two, false, game)
+            pcall(function() useKey(tc, 2, "Deactivated") end)
             return true
         end
+    else
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Two, false, game)
+        task.wait(0.02)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Two, false, game)
+        return true
+    end
         return false
     end
 
@@ -3862,15 +3962,16 @@ if mobile then
         if not tc or type(tc.UseKey) ~= "function" then return end
 
         local origUseKey = tc.UseKey
+        _G.NH_origUseKey = origUseKey
         local _hookActive = false
         tc.UseKey = function(self, slot, eventName, ...)
             -- Guard: if we're already inside our hook (e.g. BF system calling UseKey internally), pass through
             if _hookActive then return origUseKey(self, slot, eventName, ...) end
-            -- Intercept slot 2 (Haruta Backstab)
-            if slot == 2 and eventName == "Activated" and St.harutaBackstabEnabled then
+            -- Intercept slot 2 (Haruta Backstab OR Auto Shut Up for Charles/Mangaka)
+            if slot == 2 and eventName == "Activated" then
                 local ch = LocalPlayer.Character
                 local mv = ch and ch:GetAttribute("Moveset")
-                if mv == "Haruta" then
+                if St.harutaBackstabEnabled and mv == "Haruta" then
                     -- Haruta equipped: trigger backstab, suppress normal move
                     task.spawn(function()
                         local assets = ch and ch:FindFirstChild("SetAssets")
@@ -3881,8 +3982,17 @@ if mobile then
                         if _G.NH_triggerHarutaBackstab then _G.NH_triggerHarutaBackstab() end
                     end)
                     return -- suppress the default slot-2 fire
+                elseif St.autoShutUpEnabled and mv ~= "Haruta" then
+                    -- Charles / Mangaka (or any non-Haruta): pre-rotate so back faces
+                    -- the correct direction BEFORE the move fires. We do NOT suppress
+                    -- the move -- the game still fires it normally, we just face right first.
+                    -- Run in a task.spawn so the rotate is truly instant and doesn't block
+                    -- the UseKey call from returning on time.
+                    task.spawn(function()
+                        if _G.NH_shutUpRotate then _G.NH_shutUpRotate() end
+                    end)
+                    -- fall through: return origUseKey below so the move fires as normal
                 end
-                -- Not Haruta: fall through silently, no notification
             end
 
             -- Intercept slot 3 (BF Chain)
@@ -4005,7 +4115,7 @@ local Window = Fluent:CreateWindow({
 local Tabs = {
     Combat = Window:AddTab({Title="Combat", Icon="sword"}),
     Targets = Window:AddTab({Title="Targets", Icon="crosshair"}),
-    Movement = Window:AddTab({Title="Movement & BF", Icon="navigation"}),
+    Movement = Window:AddTab({Title="Movement", Icon="navigation"}),
     Characters = Window:AddTab({Title="Characters", Icon="user"}),
     Extras = Window:AddTab({Title="Extras", Icon="star"}),
     Items = Window:AddTab({Title="Items", Icon="package"}),
@@ -4013,23 +4123,171 @@ local Tabs = {
     Settings = Window:AddTab({Title="Settings", Icon="settings"})
 }
 
+-- ============================================================
+-- Flash Step M1s (PreAwk Mahito M1 Pull) — on M1, if a valid target is within range, do a smooth
+-- cubic ease-out pull to them with the Mahito Chase VFX. Toggle: St.flashStepM1Enabled.
+-- Range is read live from St.flashStepM1Range (20-50 studs). All VFX/asset access is pcall-guarded
+-- so a missing effect can never break the pull or the hub.
+-- ============================================================
+do
+    local PULL_SPEED  = 0.18  -- seconds to reach target
+    local PULL_OFFSET = 4     -- studs in front of target to land
+    local PULL_MIN    = 8     -- studs: don't flash step if the enemy is already this close (dead zone)
+    local fsCooldown  = false
+
+    local Knit, FXController, ToolController, CamShaker
+    local function fsEnsure()
+        if ToolController then return true end
+        pcall(function()
+            Knit = Knit or require(ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit"))
+            ToolController = ToolController or Knit.GetController("ToolController")
+            FXController   = FXController or Knit.GetController("FXController")
+        end)
+        pcall(function() CamShaker = CamShaker or require(ReplicatedStorage.Modules.CameraShaker) end)
+        return ToolController ~= nil
+    end
+
+    local function fsVFX(hrp, targetHRP, dashCF, magnitude)
+        pcall(function()
+            local Utils  = ReplicatedStorage.Utils
+            local Sounds = ReplicatedStorage.Sounds
+            -- Mahito.Dash beam between us and target
+            local dashBeam  = Utils.Mahito.Dash:Clone()
+            dashBeam.CFrame = dashCF + dashCF.LookVector * magnitude / 2
+            dashBeam.Size   = Vector3.new(5, 5, magnitude)
+            dashBeam.Parent = Workspace.Effects
+            TweenService:Create(dashBeam, TweenInfo.new(0.2), {
+                Size = Vector3.new(0, 0, magnitude),
+                CFrame = dashBeam.CFrame * CFrame.Angles(0, 0, math.pi)
+            }):Play()
+            Debris:AddItem(dashBeam, 0.2)
+            -- RushWind burst at our current position
+            local rushModel = Instance.new("Model")
+            local rushWind  = Utils.Itadori.RushWind:Clone()
+            rushWind.CFrame = hrp.CFrame * CFrame.new(0, -1, 0)
+            rushWind.Parent = rushModel
+            rushModel.Parent = Workspace.Effects
+            rushModel:ScaleTo(0.6)
+            rushWind.Ring:Emit(7)
+            rushWind.Dash1.Dash:Emit(1)
+            rushWind.Dash2.Dash:Emit(1)
+            Debris:AddItem(rushModel, 2)
+            -- Three staggered Shock rings
+            local function spawnShock(pos, d)
+                task.delay(d, function()
+                    pcall(function()
+                        local shock = Utils.Itadori.Shock:Clone()
+                        shock.CFrame = CFrame.new(pos) * CFrame.Angles(math.pi / 2, 0, 0)
+                        shock.Parent = Workspace.Effects
+                        TweenService:Create(shock, TweenInfo.new(0.3), {
+                            Size = Vector3.new(10, 0, 10),
+                            Transparency = 1
+                        }):Play()
+                        Debris:AddItem(shock, 0.35)
+                    end)
+                end)
+            end
+            spawnShock(targetHRP.Position, 0)
+            spawnShock(targetHRP.Position + dashCF.LookVector * 3, 0.075)
+            spawnShock(hrp.Position, 0.15)
+            -- Strike sound + camera snap
+            pcall(function() FXController:PlaySound(Sounds.Mahito.Variants.Strike, hrp, game.SoundService.Effect) end)
+            pcall(function() CamShaker.CurrentShaker:Shake(CamShaker.Presets.Snap) end)
+        end)
+    end
+
+    local function fsOnMelee()
+        if not St.flashStepM1Enabled then return end
+        if fsCooldown then return end
+        if not fsEnsure() then return end
+
+        local char = LocalPlayer.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+
+        local target
+        pcall(function() target = ToolController:GetTarget() end)
+        if not target then return end
+        local targetHRP = target:FindFirstChild("HumanoidRootPart")
+        if not targetHRP then return end
+
+        local dist = (hrp.Position - targetHRP.Position).Magnitude
+        -- Flash step is ONLY for closing a gap. If the enemy is already within PULL_MIN studs,
+        -- skip the pull and let the normal M1 land — no more spam-stepping on tiny gaps.
+        if dist <= PULL_MIN then return end
+        if dist > (St.flashStepM1Range or 20) then return end
+
+        fsCooldown = true
+        task.delay(0.35, function() fsCooldown = false end)
+
+        local dashCF    = CFrame.new(targetHRP.Position, hrp.Position)
+        local magnitude = (targetHRP.Position - hrp.Position).Magnitude
+        fsVFX(hrp, targetHRP, dashCF, magnitude)
+
+        -- Smooth pull: land PULL_OFFSET studs in front of target
+        local targetDir   = (hrp.Position - targetHRP.Position).Unit
+        local destination = targetHRP.Position + targetDir * PULL_OFFSET
+        local startPos    = hrp.Position
+        local elapsed     = 0
+
+        -- BodyVelocity burst for responsiveness
+        local bv = Instance.new("BodyVelocity")
+        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        bv.P        = 1e6
+        local diff  = destination - startPos
+        bv.Velocity = diff.Magnitude > 0.01 and diff.Unit * 80 or Vector3.new(0, 0, 0)
+        bv.Parent   = hrp
+        Debris:AddItem(bv, PULL_SPEED)
+
+        -- RenderStepped cubic ease-out for smooth landing
+        local pullConn
+        pullConn = RunService.RenderStepped:Connect(function(dt)
+            elapsed = elapsed + dt
+            local alpha = math.min(elapsed / PULL_SPEED, 1)
+            local eased = 1 - (1 - alpha) ^ 3
+            if hrp and hrp.Parent and targetHRP and targetHRP.Parent then
+                hrp.CFrame = CFrame.new(
+                    startPos:Lerp(destination, eased),
+                    Vector3.new(targetHRP.Position.X, startPos.Y, targetHRP.Position.Z)
+                )
+            end
+            if alpha >= 1 then
+                pullConn:Disconnect()
+                if bv.Parent then bv.Velocity = Vector3.new(0, 0, 0) bv:Destroy() end
+            end
+        end)
+    end
+
+    -- Connect the game's Melee keybind once; the handler self-gates on St.flashStepM1Enabled.
+    task.spawn(function()
+        if _G.M1PullMeleeConn then pcall(function() _G.M1PullMeleeConn:Disconnect() end) _G.M1PullMeleeConn = nil end
+        pcall(function()
+            local kb = ReplicatedStorage:WaitForChild("Keybind")
+            _G.M1PullMeleeConn = kb.Combat.Melee.Pressed:Connect(fsOnMelee)
+        end)
+    end)
+end
+
 -- [COMBAT]
 -- Auto Downslam sits at the very top of the Combat tab.
 Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, Callback=function(v) St.autoDownslamEnabled = v; if v then St.autoUppercutEnabled = false; pcall(function() Fluent.Options.TglAutoUppercut:SetValue(false) end) end end})
 Tabs.Combat:AddDropdown("DpDownslamMode", {Title="Auto Downslam Method", Values={"Blatant", "Legit"}, Default="Blatant", Callback=function(v) St.downslamMode = string.lower(v) end})
 Tabs.Combat:AddToggle("TglAutoUppercut", {Title="Auto Uppercut", Default=false, Callback=function(v) St.autoUppercutEnabled = v; if v then St.autoDownslamEnabled = false; pcall(function() Fluent.Options.TglAutoDownslam:SetValue(false) end) end end})
+Tabs.Combat:AddToggle("TglFlashStepM1", {Title="Flash Step M1s", Default=false, Callback=function(v) St.flashStepM1Enabled = v end})
+Tabs.Combat:AddSlider("SldFlashStepM1Range", {Title="Flash Step Range", Min=20, Max=50, Default=20, Rounding=0, Callback=function(v) St.flashStepM1Range = v end})
 
 Tabs.Combat:AddSection("Auto Blocking")
-Tabs.Combat:AddToggle("TglAutoBlockC", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v) St.autoBlockEnabled = v if v then notify("Auto Block", "Auto Block + Dash Predict enabled.", 2) else if _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Block", "Disabled.", 2) end end})
-Tabs.Combat:AddToggle("TglAutoProjBlockC", {Title="Auto Projectile Block", Default=false, Callback=function(v) St.autoProjBlockEnabled = v if v then notify("Auto Projectile Block", "ON - instantly blocks incoming projectiles.", 3) else if not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Projectile Block", "Disabled.", 2) end end})
-Tabs.Combat:AddToggle("TglAutoPunishC", {Title="Auto Punish", Default=false, Callback=function(v) St.autoPunishEnabled = v notify("Auto Punish", v and "Enabled - auto-M1 after a successful block." or "Disabled.", 2) end})
-Tabs.Combat:AddToggle("TglAutoBlockBreakC", {Title="Auto Block Break", Default=false, Callback=function(v) St.autoBlockBreakEnabled = v notify("Auto Block Break", v and "Enabled - dash behind blockers when you M1." or "Disabled.", 2) end})
+Tabs.Combat:AddToggle("TglAutoBlockC", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v) St.autoBlockEnabled = v if not v and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end end})
+Tabs.Combat:AddToggle("TglAutoProjBlockC", {Title="Auto Projectile Block", Default=false, Callback=function(v) St.autoProjBlockEnabled = v if not v and not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end end})
+Tabs.Combat:AddToggle("TglAutoPunishC", {Title="Auto Punish", Default=false, Callback=function(v) St.autoPunishEnabled = v end})
+Tabs.Combat:AddToggle("TglAutoBlockBreakC", {Title="Auto Block Break", Default=false, Callback=function(v) St.autoBlockBreakEnabled = v end})
 
 -- 0.2 Kill All: sweep / cycle-hunt / reset / AC tools all live together here.
 Tabs.Combat:AddSection("0.2 Kill All")
 Tabs.Combat:AddToggle("TglSweep", {Title="Sweep All", Default=false, Callback=function(v) St.sweepActive = v; if v then Workspace.FallenPartsDestroyHeight = Cfg.fallenHeight runSweep() else Workspace.FallenPartsDestroyHeight = St.originalFallenHeight end end})
 Tabs.Combat:AddToggle("TglSweepOverlay", {Title="Show Sweep Target Overlay", Default=false, Callback=function(v) St.overlayEnabled = v if v then buildOverlay() else destroyOverlay() end end})
-Tabs.Combat:AddButton({Title="Hunt for Cycle", Callback=runHunt})
+Tabs.Combat:AddButton({Title="Start Hunt", Callback=runHunt})
 Tabs.Combat:AddButton({Title="Stop Hunt", Callback=stopHunt})
 Tabs.Combat:AddToggle("TglDomainTP", {Title="No Domain TP", Default=false, Callback=function(v) St.noDomainTP = v end})
 Tabs.Combat:AddButton({Title="Force Reset", Callback=forceReset})
@@ -4171,20 +4429,6 @@ Tabs.Movement:AddToggle("TglWallhop", {Title="Infinite Wallhop Assist", Default=
 Tabs.Movement:AddToggle("TglDashMult", {Title="Dash Multiplier", Default=false, Callback=function(v) St.dashMultiplierEnabled = v if v then applyDashMultiplier(St.dashMultiplierValue) end end})
 Tabs.Movement:AddSlider("SldDashMult", {Title="Dash Mult Value", Min=0, Max=5, Default=1, Rounding=1, Callback=function(v) St.dashMultiplierValue = v if St.dashMultiplierEnabled then applyDashMultiplier(v) end end})
 
-Tabs.Movement:AddSection("Auto Black Flash (BF)")
-Tabs.Movement:AddToggle("TglAutoBF", {Title="Auto Black Flash Chain", Default=false, Callback=function(v) St.bfEnabled = v if v then bfStartAll() else bfStopAll() end end})
-Tabs.Movement:AddSlider("BFDetect", {Title="Detect Range", Min=4, Max=20, Default=10, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("DETECT_RANGE", v) end end})
-Tabs.Movement:AddSlider("BFCurve", {Title="Curve Width", Min=0, Max=12, Default=5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CURVE", v) end end})
-Tabs.Movement:AddSlider("BFBackGap", {Title="Back Gap", Min=1, Max=8, Default=4.5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BACKGAP", v) end end})
-Tabs.Movement:AddSlider("BFLead", {Title="Predict Lead", Min=0.1, Max=0.6, Default=0.32, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("PREDICT", v) end end})
-Tabs.Movement:AddSlider("BFCam", {Title="Camera Follow Speed", Min=0.1, Max=1.5, Default=0.6, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_SENS", v) end end})
-Tabs.Movement:AddSlider("BFTiming", {Title="BF Timing", Min=0.15, Max=0.4, Default=0.26, Rounding=3, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BF_TIMING", v) end end})
-Tabs.Movement:AddSlider("BFSpeedCap", {Title="Dash Speed Cap", Min=120, Max=600, Default=320, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("SPEEDCAP", v) end end})
-Tabs.Movement:AddSlider("BFAntiFling", {Title="Anti-Fling Sens", Min=12, Max=60, Default=28, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("ANTIFLING", v) end end})
-Tabs.Movement:AddToggle("TglBFCamFollow", {Title="BF Camera Follow", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_STEER", v) end end})
-Tabs.Movement:AddToggle("TglBFAutoFlash", {Title="Auto Flash on Arrival", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("AUTO_BF", v) end end})
-Tabs.Movement:AddToggle("TglBFChain", {Title="Chain Reposition", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CHAIN", v) end end})
-
 -- [CHARACTERS]
 -- ===== Auto Todo Black Flash =====
 -- Auto follow-ups for Todo: listens on the character's Humanoid.AnimationPlayed and fires the
@@ -4231,48 +4475,700 @@ local function enableTodoBlackFlash()
     _G.TODOBLACKFLASH_CHARCONN = LocalPlayer.CharacterAdded:Connect(todoBlackFlashConnectCharacter)
 end
 
-Tabs.Characters:AddSection("Haruta Backstab")
-Tabs.Characters:AddParagraph({Title="Haruta Backstab Info", Content="As Haruta (with sword equipped), press key 2 on PC or the BACKSTAB mobile button to dash behind your nearest target and fire the Backstab move. Toggle this on to enable.\n\nMobile: pressing your 2nd move while Haruta Backstab is enabled will dash+backstab. Use the 'Show Backstab Button' toggle below to also get a dedicated on-screen button.\n\nIf you are NOT Haruta on mobile and tap the button, you'll get a notification. On PC the key just acts normally for your current character."})
-Tabs.Characters:AddToggle("TglHarutaBs", {Title="Haruta Backstab", Default=false, Callback=function(v) St.harutaBackstabEnabled = v if v then notify("Haruta Backstab", "Enabled - equip sword, press 2 (PC) or move button/BACKSTAB (mobile).", 3) else notify("Haruta Backstab", "Disabled.", 2) end end})
+-- ============================================================
+-- AUTO MOVE VARIANTS (World Slash / Frog / Earthquake / Shut Up)
+-- Services verified live via MCP under ReplicatedStorage.Knit.Knit.Services:
+--   RushService / FlameArrowService / ItadoriService / NueService / EarthquakeService.
+-- Pattern mirrors Auto Todo Black Flash: use the move in-game, the variant auto-fires.
+-- ============================================================
+do
+    local Svcs = ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit"):WaitForChild("Services")
+    local function movesetChild(name)
+        local ch = LocalPlayer.Character
+        local ms = ch and ch:FindFirstChild("Moveset")
+        return ms and ms:FindFirstChild(name)
+    end
+
+    -- Auto World Cutting Slash: Rush -> FlameArrow -> (0.8s) -> Itadori RightActivated, only on full ult
+    _G.WORLDSLASH = _G.WORLDSLASH or {}
+    local function disconnectWorldSlash()
+        for _, c in ipairs(_G.WORLDSLASH) do pcall(function() c:Disconnect() end) end
+        _G.WORLDSLASH = {}
+        if _G.WORLDSLASH_CHARCONN then pcall(function() _G.WORLDSLASH_CHARCONN:Disconnect() end) _G.WORLDSLASH_CHARCONN = nil end
+    end
+    local function worldSlashConnect(character)
+        local humanoid = character:WaitForChild("Humanoid")
+        table.insert(_G.WORLDSLASH, humanoid.AnimationPlayed:Connect(function(track)
+            if not St.autoWorldSlashEnabled then return end
+            if not (track.Animation and track.Animation.AnimationId == "rbxassetid://131506102901134") then return end
+            local full = false
+            pcall(function() full = (LocalPlayer.PlayerGui.Main.Controls.Ultimate.Special.Fill.Size.X.Scale >= 1) end)
+            if not full then return end
+            local rush, open = movesetChild("Rush"), movesetChild("Open")
+            pcall(function() if rush then Svcs.RushService.RE.Activated:FireServer(rush) end end)
+            pcall(function() if open then Svcs.FlameArrowService.RE.Activated:FireServer(open) end end)
+            task.wait(.8)
+            pcall(function() Svcs.ItadoriService.RE.RightActivated:FireServer() end)
+        end))
+    end
+    _G.NH_enableWorldSlash = function()
+        disconnectWorldSlash()
+        if LocalPlayer.Character then worldSlashConnect(LocalPlayer.Character) end
+        _G.WORLDSLASH_CHARCONN = LocalPlayer.CharacterAdded:Connect(worldSlashConnect)
+    end
+    _G.NH_disableWorldSlash = disconnectWorldSlash
+
+    -- Auto Frog Variant (Megumi / Ten Shadows): NueService.Activated with Moveset.Nue
+    _G.FROGVARIANT = _G.FROGVARIANT or {}
+    local function disconnectFrog()
+        for _, c in ipairs(_G.FROGVARIANT) do pcall(function() c:Disconnect() end) end
+        _G.FROGVARIANT = {}
+        if _G.FROGVARIANT_CHARCONN then pcall(function() _G.FROGVARIANT_CHARCONN:Disconnect() end) _G.FROGVARIANT_CHARCONN = nil end
+    end
+    local function frogConnect(character)
+        local humanoid = character:WaitForChild("Humanoid")
+        table.insert(_G.FROGVARIANT, humanoid.AnimationPlayed:Connect(function(track)
+            if not St.autoFrogVariantEnabled then return end
+            if not (track.Animation and track.Animation.AnimationId == "rbxassetid://116432619539029") then return end
+            local nue = movesetChild("Nue")
+            if not nue then return end
+            pcall(function() Svcs.NueService.RE.Activated:FireServer(nue) end)
+        end))
+    end
+    _G.NH_enableFrog = function()
+        disconnectFrog()
+        if LocalPlayer.Character then frogConnect(LocalPlayer.Character) end
+        _G.FROGVARIANT_CHARCONN = LocalPlayer.CharacterAdded:Connect(frogConnect)
+    end
+    _G.NH_disableFrog = disconnectFrog
+
+    -- Auto Earthquake (Mahoraga): release EarthquakeService.Deactivated(move,false) near the hit
+    _G.EARTHQUAKE = _G.EARTHQUAKE or {}
+    local function disconnectEq()
+        for _, c in ipairs(_G.EARTHQUAKE) do pcall(function() c:Disconnect() end) end
+        _G.EARTHQUAKE = {}
+        if _G.EARTHQUAKE_CHARCONN then pcall(function() _G.EARTHQUAKE_CHARCONN:Disconnect() end) _G.EARTHQUAKE_CHARCONN = nil end
+    end
+    local function eqConnect(character)
+        local humanoid = character:WaitForChild("Humanoid")
+        table.insert(_G.EARTHQUAKE, humanoid.AnimationPlayed:Connect(function(track)
+            if not St.autoEarthquakeEnabled then return end
+            if not (track.Animation and track.Animation.AnimationId == "rbxassetid://85024950165903") then return end
+            local t0 = os.clock()
+            repeat task.wait() until (track.TimePosition >= .7) or (not track.IsPlaying) or (os.clock() - t0 > 2)
+            local eq = movesetChild("Earthquake")
+            if not eq then return end
+            pcall(function() Svcs.EarthquakeService.RE.Deactivated:FireServer(eq, false) end)
+        end))
+    end
+    _G.NH_enableEq = function()
+        disconnectEq()
+        if LocalPlayer.Character then eqConnect(LocalPlayer.Character) end
+        _G.EARTHQUAKE_CHARCONN = LocalPlayer.CharacterAdded:Connect(eqConnect)
+    end
+    _G.NH_disableEq = disconnectEq
+
+    -- Auto Shut Up (Charles / Mangaka): when you use the Shut Up move, instantly turn your BACK
+    -- toward the nearest enemy within range (Shut Up only lands when the target is behind you).
+    -- Fires on BOTH the Shut Up animation AND the move slot-2 key, and finds targets the SAME way
+    -- the aimbot/lock-on does (real players + nearby NPC humanoids), so it can't miss the enemy.
+    _G.SHUTUP = _G.SHUTUP or {}
+    local shutUpBusy = false
+    local function disconnectShutUp()
+        if _G.SHUTUP_STOP then local f = _G.SHUTUP_STOP; _G.SHUTUP_STOP = nil; pcall(f) end
+        pcall(function() RunService:UnbindFromRenderStep("NH_ShutUpFace") end)
+        for _, c in ipairs(_G.SHUTUP) do pcall(function() c:Disconnect() end) end
+        _G.SHUTUP = {}
+        if _G.SHUTUP_CHARCONN then pcall(function() _G.SHUTUP_CHARCONN:Disconnect() end) _G.SHUTUP_CHARCONN = nil end
+    end
+    local function shutUpNearestCore(myHrp)
+        local best, bestDist = nil, 10  -- 10 studs: only snap back toward enemy if this close
+        -- real players
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                local core = p.Character:FindFirstChild("HumanoidRootPart") or p.Character:FindFirstChild("Torso")
+                if hum and core and hum.Health > 0 then
+                    local d = (core.Position - myHrp.Position).Magnitude
+                    if d <= bestDist then bestDist = d; best = core end
+                end
+            end
+        end
+        -- nearby NPC humanoids (training dummies / bosses) within range
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Humanoid") and obj.Health > 0 then
+                local model = obj.Parent
+                if model and model:IsA("Model") and model ~= LocalPlayer.Character and not Players:GetPlayerFromCharacter(model) then
+                    local core = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+                    if core then
+                        local d = (core.Position - myHrp.Position).Magnitude
+                        if d <= bestDist then bestDist = d; best = core end
+                    end
+                end
+            end
+        end
+        return best
+    end
+    local function shutUpStopHold()
+        if _G.SHUTUP_STOP then
+            local f = _G.SHUTUP_STOP
+            _G.SHUTUP_STOP = nil
+            pcall(f)
+        end
+    end
+    -- Decide, every frame, which way our BACK should point. Recomputed live so it tracks a
+    -- moving enemy and follows the camera under shiftlock (exactly like the BF chain does).
+    local function shutUpBackDir(myHrp, lockedTarget)
+        -- Priority 1: enemy within 10 studs → back faces TOWARD them (camera-independent).
+        if lockedTarget and lockedTarget.Parent then
+            local flat = (lockedTarget.Position - myHrp.Position) * Vector3.new(1, 0, 1)
+            if flat.Magnitude >= 0.1 then return flat.Unit end
+        end
+        -- Priority 2: no enemy → back faces where the player is aiming.
+        local camFlat = Camera.CFrame.LookVector * Vector3.new(1, 0, 1)
+        local hrpFlat = myHrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+        local camOk = camFlat.Magnitude >= 0.1
+        local hrpOk = hrpFlat.Magnitude >= 0.1
+        -- Shiftlock detection that works on PC (MouseBehavior) AND mobile (the shiftlock button
+        -- keeps camera + body aligned). In shiftlock the camera look IS the intended facing, so
+        -- back = camera look. In free cam the camera can point INTO our back, so use body facing.
+        local shiftLock = (UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter)
+        if not shiftLock and camOk and hrpOk then
+            shiftLock = camFlat.Unit:Dot(hrpFlat.Unit) > 0.85
+        end
+        if shiftLock and camOk then
+            return camFlat.Unit
+        elseif hrpOk then
+            return hrpFlat.Unit
+        elseif camOk then
+            return camFlat.Unit
+        end
+        return Vector3.new(0, 0, 1)
+    end
+    local function shutUpFace(hrp, lockedTarget)
+        local backDir = shutUpBackDir(hrp, lockedTarget)
+        local pos = hrp.Position
+        -- lookAt(pos, pos - backDir) makes our LookVector = -backDir, so our BACK points to backDir.
+        hrp.CFrame = CFrame.lookAt(pos, pos - backDir)
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+    local SHUTUP_HOLD_TIME = 0.6  -- seconds to hold our back locked to the enemy (covers the grab)
+    local function shutUpRotate()
+        if not St.autoShutUpEnabled then return end
+        if shutUpBusy then return end
+        local ch = LocalPlayer.Character
+        local myHrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not myHrp then return end
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        shutUpBusy = true
+
+        -- Lock onto the nearest enemy once (if within 10 studs); tracked live below.
+        local lockedTarget = shutUpNearestCore(myHrp)
+        local prevAutoRotate = hum.AutoRotate
+        hum.AutoRotate = false
+
+        -- 1) IMMEDIATE, synchronous turn. This is what makes the move GRAB: the game samples our
+        --    facing the instant the move fires, so our back must already be turned right now — not
+        --    one frame later. (The old version only started turning next frame, so it whiffed.)
+        pcall(function() shutUpFace(myHrp, lockedTarget) end)
+
+        -- 2) HOLD it against shiftlock. Shiftlock + the game's camera re-rotate the character to
+        --    face the camera, and they do it in different frame phases. A render-only override
+        --    flickers and the server never sees it. So we reassert our facing in ALL phases:
+        --    BindToRenderStep at Last (wins the on-screen frame) + Stepped + Heartbeat (win the
+        --    physics/replicated state the server reads for the grab). Held for a short window.
+        shutUpStopHold()
+        local conns = {}
+        local t0 = tick()
+        local function cleanup()
+            for _, cn in ipairs(conns) do pcall(function() cn:Disconnect() end) end
+            pcall(function() RunService:UnbindFromRenderStep("NH_ShutUpFace") end)
+            pcall(function() if hum and hum.Parent then hum.AutoRotate = prevAutoRotate end end)
+        end
+        _G.SHUTUP_STOP = cleanup
+        local function tickFn()
+            local c = LocalPlayer.Character
+            local hrp2 = c and c:FindFirstChild("HumanoidRootPart")
+            if (not hrp2) or (not St.autoShutUpEnabled) or (tick() - t0 > SHUTUP_HOLD_TIME) then
+                shutUpStopHold()
+                return
+            end
+            pcall(function() shutUpFace(hrp2, lockedTarget) end)
+        end
+        table.insert(conns, RunService.Stepped:Connect(function() tickFn() end))
+        table.insert(conns, RunService.Heartbeat:Connect(function() tickFn() end))
+        pcall(function()
+            RunService:BindToRenderStep("NH_ShutUpFace", Enum.RenderPriority.Last.Value, tickFn)
+        end)
+
+        task.delay(SHUTUP_HOLD_TIME + 0.1, function() shutUpBusy = false end)
+    end
+    _G.NH_shutUpRotate = shutUpRotate
+    local function shutUpConnect(character)
+        local humanoid = character:WaitForChild("Humanoid")
+        table.insert(_G.SHUTUP, humanoid.AnimationPlayed:Connect(function(track)
+            if not St.autoShutUpEnabled then return end
+            if track.Animation and track.Animation.AnimationId == "rbxassetid://79860101129549" then
+                shutUpRotate()
+            end
+        end))
+    end
+    _G.NH_enableShutUp = function()
+        disconnectShutUp()
+        if LocalPlayer.Character then shutUpConnect(LocalPlayer.Character) end
+        _G.SHUTUP_CHARCONN = LocalPlayer.CharacterAdded:Connect(shutUpConnect)
+
+        -- PC: fire on key 2 press (move slot 2 = Shut Up)
+        table.insert(_G.SHUTUP, UserInputService.InputBegan:Connect(function(input, gpe)
+            if gpe then return end
+            if not St.autoShutUpEnabled then return end
+            if input.KeyCode == Enum.KeyCode.Two then shutUpRotate() end
+        end))
+
+        -- ALL PLATFORMS: hook ToolController.UseKey, the game's own move dispatcher. This is the
+        -- most reliable trigger: it runs the instant slot 2 (Shut Up) is used, BEFORE the move is
+        -- sent to the server. We rotate SYNCHRONOUSLY right here so our back is already turned when
+        -- the grab fires — that one-frame head start is what makes the move actually connect.
+        task.spawn(function()
+            local ok, Knit = pcall(function()
+                return require(ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit"))
+            end)
+            if not ok or not Knit then return end
+            local tc = nil
+            pcall(function() tc = Knit.GetController("ToolController") end)
+            if not tc or type(tc.UseKey) ~= "function" then return end
+            if tc._NH_shutUpPatched then return end
+            tc._NH_shutUpPatched = true
+            local origUseKey = tc.UseKey
+            tc.UseKey = function(self, slot, eventName, ...)
+                if slot == 2 and eventName == "Activated" and St.autoShutUpEnabled then
+                    local ch2 = LocalPlayer.Character
+                    local mv2 = ch2 and ch2:GetAttribute("Moveset")
+                    if mv2 ~= "Haruta" then
+                        pcall(shutUpRotate)  -- synchronous: turn BEFORE the move is sent
+                    end
+                end
+                return origUseKey(self, slot, eventName, ...)
+            end
+            table.insert(_G.SHUTUP, {
+                Disconnect = function()
+                    if tc and tc._NH_shutUpPatched then
+                        tc.UseKey = origUseKey
+                        tc._NH_shutUpPatched = nil
+                    end
+                end
+            })
+        end)
+    end
+    _G.NH_disableShutUp = disconnectShutUp
+end
+
+-- ============================================================
+-- AUTO COUNTER SYSTEM
+-- Fires the character's counter move(s) on any incoming threat
+-- instead of blocking. Works with every counter move in the game.
+-- Gate: only counters if target.Ragdoll == 0, you have a sword,
+-- and the target's LookVector faces you.
+-- ============================================================
+do
+    -- Init global flags for external script compatibility
+    getgenv().AutoCounter = getgenv().AutoCounter or false
+    getgenv().AutoCounterRange = getgenv().AutoCounterRange or 22
+    getgenv().NH_autoCounterRunning = getgenv().NH_autoCounterRunning or false
+
+    -- Detection ranges. M1s are gated tight (real hit range) so we never counter an M1 from
+    -- across the gap; ranged/aerial moves are allowed much further out so projectiles and
+    -- abilities still get countered. Tweak these numbers to taste.
+    local AC_M1_RANGE = 10       -- close-range M1 / melee detection
+    local AC_RANGED_RANGE = 60   -- projectiles, aerials, abilities (long range OK)
+    local AC_DASH_RANGE = 22     -- incoming dash / rush detection
+    local acBusySince = 0        -- timestamp for the busy-state watchdog (declared early so
+                                 -- fireCounterChain captures it as an upvalue)
+
+    -- Animation IDs we should NEVER treat as a threat (enemy idle/locomotion, or known
+    -- non-damaging Action-priority anims). Add IDs here to suppress any false counters.
+    local AC_SAFE_ANIMS = {}
+
+    local KnitSvc = ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit"):WaitForChild("Services")
+
+    -- Every counter move in the game mapped to its service + remote
+    -- Each entry: MoveName = { service = "ServiceName", remote = "RemoteName", needsMove = bool }
+    -- "needsMove" = true means you pass the moveset child instance (ms["Move Name"])
+    -- "needsMove" = false means the remote takes no args or no moveset child
+    local COUNTER_MAP = {
+        ["Manji Kick"]     = { svc = "ManjiKickService",     remote = "Activated", needsMove = true },
+        ["Head Splitter"]  = { svc = "HeadSplitterService",  remote = "Activated", needsMove = true },
+        ["Eye Catching"]   = { svc = "EyeCatchService",      remote = "Activated", needsMove = true },
+        ["Adaptation"]     = { svc = "AdaptationService",    remote = "Activated", needsMove = true },
+        ["Outburst"]       = { svc = "OutburstService",      remote = "Activated", needsMove = true },
+        ["Supernova"]      = { svc = "SupernovaService",     remote = "Activated", needsMove = true },
+        ["Shut Up"]        = { svc = "ShutUpService",        remote = "Activated", needsMove = true },
+        ["Decisive Strike"] = { svc = "DecisiveStrikeService", remote = "Activated", needsMove = true },
+        ["Defense Response"] = { svc = "DefenseResponseService", remote = "Activated", needsMove = true },
+    }
+
+    -- Sub-triggers that fire when their conditions are met (Hakari rightclick, Supernova)
+    -- Condition: attribute Makora == 2 AND character has no Convergence/JackpotAura
+    local SUB_TRIGGERS = {
+        { svc = "HakariService",  remote = "RightActivated", needsMove = false,
+          condition = function(char)
+              local makora = LocalPlayer:GetAttribute("Makora") or 0
+              if makora ~= 2 then return false end
+              if char:FindFirstChild("Convergence") or char:FindFirstChild("JackpotAura") then return false end
+              return true
+          end
+        },
+        { svc = "SupernovaService", remote = "Activated", needsMove = true, moveName = "Supernova",
+          condition = function(char)
+              local makora = LocalPlayer:GetAttribute("Makora") or 0
+              if makora ~= 2 then return false end
+              if char:FindFirstChild("Convergence") or char:FindFirstChild("JackpotAura") then return false end
+              return true
+          end
+        },
+    }
+
+    -- Ultimate moves (fire when ult meter is full)
+    local ULT_MOVES = {
+        { svc = "NaoyaService",  remote = "Ultimate", needsMove = false },
+        { svc = "CharlesService", remote = "Ultimate", needsMove = false },
+    }
+
+    -- Core: fire the block + all counter moves we have in our moveset
+    local function fireCounterChain(targetHRP)
+        if St.autoCounterBusy then return end
+        if St.autoCounterCooldown > 0 then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        -- Gate: must not be ragdolled
+        if (char:GetAttribute("Ragdoll") or 0) ~= 0 then return end
+        local ms = char:FindFirstChild("Moveset")
+        if not ms then return end
+
+        -- Gate: must have sword equipped for counter moves that need one
+        local hasSword = char.Info and char.Info:FindFirstChild("Sword") ~= nil
+        if not hasSword then
+            -- Check if any counter move in our moveset doesn't require sword
+            local anyNonSwordCounter = false
+            for moveName in pairs(COUNTER_MAP) do
+                if ms:FindFirstChild(moveName) then
+                    anyNonSwordCounter = true
+                    break
+                end
+            end
+            -- Also check sub-triggers
+            for _, st in ipairs(SUB_TRIGGERS) do
+                if not st.needsMove or (st.moveName and ms:FindFirstChild(st.moveName)) then
+                    anyNonSwordCounter = true
+                    break
+                end
+            end
+            if not anyNonSwordCounter then return end
+        end
+
+        -- Gate: target must be facing you (LookVector toward you)
+        if targetHRP and targetHRP.Parent then
+            local toMe = (char.HumanoidRootPart.Position - targetHRP.Position) * Vector3.new(1,0,1)
+            if toMe.Magnitude > 0.5 then
+                local lookDot = targetHRP.CFrame.LookVector:Dot(toMe.Unit)
+                if lookDot < 0.1 then return end  -- not facing us enough
+            end
+        end
+
+        St.autoCounterBusy = true
+        St.autoCounterCooldown = 8  -- frames cooldown
+        acBusySince = os.clock()
+
+        -- STEP 1: Fire block to enter counter stance
+        if hasSword then
+            pcall(function() KnitSvc.BlockService.RE.Activated:FireServer() end)
+        end
+
+        -- STEP 2: Fire every counter move present in our moveset
+        for moveName, cfg in pairs(COUNTER_MAP) do
+            local moveInst = ms:FindFirstChild(moveName)
+            if moveInst then
+                local svc = KnitSvc:FindFirstChild(cfg.svc)
+                if svc then
+                    local re = svc.RE and svc.RE:FindFirstChild(cfg.remote)
+                    if re then
+                        if cfg.needsMove then
+                            pcall(function() re:FireServer(moveInst) end)
+                        else
+                            pcall(function() re:FireServer() end)
+                        end
+                    end
+                end
+            end
+        end
+
+        -- STEP 3: Sub-triggers (Hakari RightActivated, Supernova) -- only fire when condition met (Makora == 2, no Convergence/JackpotAura)
+        for _, st in ipairs(SUB_TRIGGERS) do
+            if st.condition and not st.condition(char) then continue end
+            local svc = KnitSvc:FindFirstChild(st.svc)
+            if svc then
+                local re = svc.RE and svc.RE:FindFirstChild(st.remote)
+                if re then
+                    if st.needsMove and st.moveName then
+                        local mi = ms:FindFirstChild(st.moveName)
+                        if mi then
+                            pcall(function() re:FireServer(mi) end)
+                        end
+                    else
+                        pcall(function() re:FireServer() end)
+                    end
+                end
+            end
+        end
+
+        -- STEP 4: Ultimate chain when meter is full
+        local ultFull = false
+        pcall(function() ultFull = (LocalPlayer:GetAttribute("Ultimate") or 0) >= 100 end)
+        if ultFull then
+            for _, um in ipairs(ULT_MOVES) do
+                local svc = KnitSvc:FindFirstChild(um.svc)
+                if svc then
+                    local re = svc.RE and svc.RE:FindFirstChild(um.remote)
+                    if re then
+                        pcall(function() re:FireServer() end)
+                    end
+                end
+            end
+        end
+
+        -- Cooldown timer -- kept short so a multi-hit combo can be countered hit-after-hit.
+        task.delay(0.25, function()
+            St.autoCounterBusy = false
+        end)
+        task.delay(0.12, function()
+            St.autoCounterCooldown = 0
+            -- Release block after counter
+            pcall(function() KnitSvc.BlockService.RE.Deactivated:FireServer() end)
+        end)
+    end
+
+    -- Threat detection: reused from auto block system
+    -- M1 animation IDs (same as auto block)
+    local M1_ANIMS = {
+        ["rbxassetid://95295463826732"] = true,
+        ["rbxassetid://105077924973072"] = true,
+        ["rbxassetid://124862357369335"] = true,
+        ["rbxassetid://81630213087988"] = true,
+    }
+    -- Projectile cast animation IDs
+    local PROJ_CAST_IDS = {
+        ["rbxassetid://17207807777"] = true, ["rbxassetid://17207806991"] = true,
+        ["rbxassetid://17207806413"] = true, ["rbxassetid://17207805758"] = true,
+        ["rbxassetid://17207805299"] = true, ["rbxassetid://17207804676"] = true,
+        ["rbxassetid://17207804009"] = true,
+    }
+
+    local acAnimDebounce = {}
+    local acEnemyData = {}
+    local acDashRange = 25
+    local acMeleeRange = 12
+
+    local function acHeartbeat()
+        if Cn.autoCounterConn then Cn.autoCounterConn:Disconnect() end
+        Cn.autoCounterConn = RunService.Heartbeat:Connect(function()
+            if not St.autoCounterEnabled then return end
+            if St.autoCounterCooldown > 0 then
+                St.autoCounterCooldown = St.autoCounterCooldown - 1
+            end
+            -- Watchdog: never let the busy flag stick (prevents a wedged, non-countering state).
+            if St.autoCounterBusy and (os.clock() - acBusySince) > 0.6 then
+                St.autoCounterBusy = false
+            end
+            local char = LocalPlayer.Character
+            if not char then return end
+            if (char:GetAttribute("Ragdoll") or 0) ~= 0 then return end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+
+            -- Check nearby enemies for dashes / high-speed movement
+            local enemies = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then table.insert(enemies, p.Character) end
+            end
+            local chars = Workspace:FindFirstChild("Characters")
+            if chars then
+                for _, v in ipairs(chars:GetChildren()) do
+                    if v:IsA("Model") and v ~= char then
+                        local dup = false
+                        for _, e in ipairs(enemies) do if e == v then dup = true break end end
+                        if not dup then table.insert(enemies, v) end
+                    end
+                end
+            end
+
+            for _, enemyChar in ipairs(enemies) do
+                local ohrp = enemyChar:FindFirstChild("HumanoidRootPart")
+                local ohum = enemyChar:FindFirstChildOfClass("Humanoid")
+                if not ohrp or not ohum or ohum.Health <= 0 then continue end
+                local dist = (ohrp.Position - hrp.Position).Magnitude
+                if dist > AC_DASH_RANGE then continue end
+
+                -- Dash detection
+                local dir = (ohrp.Position - hrp.Position).Unit
+                local vel = ohrp.Velocity
+                local speedToward = vel:Dot(-dir)
+                if not acEnemyData[enemyChar] then acEnemyData[enemyChar] = { lastVel = Vector3.zero, dashCooldown = 0 } end
+                local data = acEnemyData[enemyChar]
+                local accel = (vel - data.lastVel).Magnitude
+                data.lastVel = vel
+                if data.dashCooldown > 0 then data.dashCooldown = data.dashCooldown - 1 end
+                if (accel > 18 and speedToward > 16) or (speedToward > 45) then
+                    if data.dashCooldown <= 0 then
+                        data.dashCooldown = 24
+                        St.autoCounterCooldown = 0
+                        fireCounterChain(ohrp)
+                        break
+                    end
+                end
+            end
+        end)
+    end
+
+    local function acAnimationDetect()
+        if Cn.autoCounterAnimConn then Cn.autoCounterAnimConn:Disconnect() end
+        Cn.autoCounterAnimConn = RunService.Heartbeat:Connect(function()
+            if not St.autoCounterEnabled then return end
+            local char = LocalPlayer.Character
+            if not char then return end
+            if (char:GetAttribute("Ragdoll") or 0) ~= 0 then return end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+
+            local enemies = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then table.insert(enemies, p.Character) end
+            end
+            local chars = Workspace:FindFirstChild("Characters")
+            if chars then
+                for _, v in ipairs(chars:GetChildren()) do
+                    if v:IsA("Model") and v ~= char then
+                        local dup = false
+                        for _, e in ipairs(enemies) do if e == v then dup = true break end end
+                        if not dup then table.insert(enemies, v) end
+                    end
+                end
+            end
+
+            for _, enemyChar in ipairs(enemies) do
+                local ohrp = enemyChar:FindFirstChild("HumanoidRootPart")
+                local ohum = enemyChar:FindFirstChildOfClass("Humanoid")
+                if not ohrp or not ohum or ohum.Health <= 0 then continue end
+                local dist = (ohrp.Position - hrp.Position).Magnitude
+                if dist > AC_RANGED_RANGE then continue end
+
+                for _, track in ipairs(ohum:GetPlayingAnimationTracks()) do
+                    local id = track.Animation and track.Animation.AnimationId or ""
+                    if AC_SAFE_ANIMS[id] then continue end
+                    -- M1s must be in REAL hit range (AC_M1_RANGE) so we don't counter someone
+                    -- throwing an M1 from across the gap. Everything else -- known projectile
+                    -- casts, plus ANY Action-priority move (aerials, abilities, ults, moves
+                    -- we've never seen) -- is allowed out to AC_RANGED_RANGE so ranged threats
+                    -- still get countered. Locomotion is Core/Idle/Movement priority -> ignored.
+                    local isM1 = M1_ANIMS[id]
+                    local isRanged = PROJ_CAST_IDS[id] or (tostring(track.Priority):find("Action") ~= nil)
+                    local threat = false
+                    if isM1 then
+                        threat = (dist <= AC_M1_RANGE)
+                    elseif isRanged then
+                        threat = (dist <= AC_RANGED_RANGE)
+                    end
+                    if threat then
+                        local key = tostring(enemyChar) .. id
+                        if not acAnimDebounce[key] then
+                            acAnimDebounce[key] = true
+                            task.delay(0.18, function() acAnimDebounce[key] = nil end)
+                            fireCounterChain(ohrp)
+                            return
+                        end
+                    end
+                end
+            end
+        end)
+    end
+
+    -- HIT RE-ARM: the usual cause of "it stopped countering after I got hit a few times" is
+    -- the counter state wedging mid-combo. Every time WE take damage, force the counter fully
+    -- back to ready and wipe the per-move debounce so the NEXT incoming hit is always
+    -- counterable. This is a pure state reset -- it does NOT widen the detection range.
+    local acLastHealth = nil
+    local function armHitRetry()
+        if Cn.autoCounterHitConn then Cn.autoCounterHitConn:Disconnect(); Cn.autoCounterHitConn = nil end
+        local char = LocalPlayer.Character
+        if not char then return end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        acLastHealth = hum.Health
+        Cn.autoCounterHitConn = hum.HealthChanged:Connect(function(h)
+            if St.autoCounterEnabled and acLastHealth and h < acLastHealth then
+                St.autoCounterBusy = false
+                St.autoCounterCooldown = 0
+                table.clear(acAnimDebounce)
+            end
+            acLastHealth = h
+        end)
+    end
+
+    local function enableAutoCounter()
+        St.autoCounterEnabled = true
+        getgenv().AutoCounter = true
+        getgenv().NH_autoCounterRunning = true
+        acHeartbeat()
+        acAnimationDetect()
+        armHitRetry()
+        if Cn.autoCounterCharConn then Cn.autoCounterCharConn:Disconnect() end
+        Cn.autoCounterCharConn = LocalPlayer.CharacterAdded:Connect(function()
+            task.wait(0.4)
+            if St.autoCounterEnabled then armHitRetry() end
+        end)
+        notify("Auto Counter", "Enabled. Fires counter on any incoming threat.", 3)
+    end
+
+    local function disableAutoCounter()
+        St.autoCounterEnabled = false
+        getgenv().AutoCounter = false
+        getgenv().NH_autoCounterRunning = false
+        St.autoCounterBusy = false
+        St.autoCounterCooldown = 0
+        if Cn.autoCounterConn then Cn.autoCounterConn:Disconnect(); Cn.autoCounterConn = nil end
+        if Cn.autoCounterAnimConn then Cn.autoCounterAnimConn:Disconnect(); Cn.autoCounterAnimConn = nil end
+        if Cn.autoCounterHitConn then Cn.autoCounterHitConn:Disconnect(); Cn.autoCounterHitConn = nil end
+        if Cn.autoCounterCharConn then Cn.autoCounterCharConn:Disconnect(); Cn.autoCounterCharConn = nil end
+        acEnemyData = {}
+        notify("Auto Counter", "Disabled.", 2)
+    end
+
+    -- Expose for UI toggle and potential reuse
+    _G.NH_enableAutoCounter = enableAutoCounter
+    _G.NH_disableAutoCounter = disableAutoCounter
+end
+
+Tabs.Characters:AddSection("Auto Character Moves")
+Tabs.Characters:AddToggle("TglTodoPerfectSwap", {Title="Auto Todo Perfect Swap", Default=false, Callback=function(v) St.todoEnabled = v end})
+Tabs.Characters:AddToggle("TglTodoBlackFlash", {Title="Auto Todo Black Flash", Default=false, Callback=function(v) St.todoBlackFlashEnabled = v if v then enableTodoBlackFlash() else disconnectTodoBlackFlash() end end})
+Tabs.Characters:AddToggle("TglNanami", {Title="Auto Nanami Ratio", Default=false, Callback=function(v) if v then startNanami() else stopNanami() end end})
+Tabs.Characters:AddButton({Title="Instant Blackhole (Yuki)", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/InstantBlackHole.JJS"))() end) end})
+Tabs.Characters:AddToggle("TglAutoWorldSlash", {Title="Auto World Cutting Slash", Default=false, Callback=function(v) St.autoWorldSlashEnabled = v if v then _G.NH_enableWorldSlash() else _G.NH_disableWorldSlash() end notify("Auto World Slash", v and "Enabled - use the move with a full ult bar." or "Disabled.", 2) end})
+Tabs.Characters:AddToggle("TglAutoFrogVariant", {Title="Auto Frog Variant (Megumi)", Default=false, Callback=function(v) St.autoFrogVariantEnabled = v if v then _G.NH_enableFrog() else _G.NH_disableFrog() end notify("Auto Frog Variant", v and "Enabled." or "Disabled.", 2) end})
+Tabs.Characters:AddToggle("TglAutoEarthquake", {Title="Auto Earthquake (Mahoraga)", Default=false, Callback=function(v) St.autoEarthquakeEnabled = v if v then _G.NH_enableEq() else _G.NH_disableEq() end notify("Auto Earthquake", v and "Enabled." or "Disabled.", 2) end})
+Tabs.Characters:AddToggle("TglAutoShutUp", {Title="Auto Shut Up (Mangaka)", Default=false, Callback=function(v) St.autoShutUpEnabled = v if v then _G.NH_enableShutUp() else _G.NH_disableShutUp() end notify("Auto Shut Up", v and "Enabled - snaps your back to the nearest enemy on the move." or "Disabled.", 2) end})
+Tabs.Characters:AddToggle("TglAutoCounter", {Title="Auto Counter", Default=false, Callback=function(v) if v then _G.NH_enableAutoCounter() else _G.NH_disableAutoCounter() end end})
+
+Tabs.Characters:AddParagraph({Title="Haruta Backstab Info", Content="Equip Haruta with sword. Press 2 (PC) or tap your 2nd move (mobile) to dash behind your target and backstab. Want a separate mobile button too? Turn on 'Show Backstab UI Button'. You can enable this UI button in the Settings tab."})
+Tabs.Characters:AddToggle("TglHarutaBs", {Title="Haruta Backstab", Default=false, Callback=function(v) St.harutaBackstabEnabled = v end})
 if mobile then
     Tabs.Characters:AddToggle("TglHarutaBsBtn", {Title="Show Backstab UI Button", Default=false, Callback=function(v) St.harutaBsBtnEnabled = v end})
 end
+Tabs.Characters:AddToggle("TglAutoQTE", {Title="Auto QTE (Hiromi & Beam Clash)", Default=false, Callback=function(v) St.autoQteEnabled = v if v then startAutoQTE() else stopAutoQTE() end end})
+Tabs.Characters:AddSlider("SldQTESpeed", {Title="QTE Speed (Clicks per sec)", Min=1, Max=50, Default=15, Rounding=0, Callback=function(v) St.qteSpeed = v end})
+Tabs.Characters:AddButton({Title="Higuruma Vote Viewer", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/HigarumaVoteView.JJS"))() end) end})
 
-Tabs.Characters:AddSection("Todo")
-Tabs.Characters:AddParagraph({Title="Black Flash Chain Info", Content="Mobile: pressing your 3rd move while BF Chain is enabled will trigger a dash+flash. Use 'Show BF Chain Button' to also get a dedicated on-screen button. If BF Chain is on but you're using a different character's 3rd move, the move fires normally with no notification."})
-Tabs.Characters:AddToggle("TglAutoBFC", {Title="Auto Black Flash Chain", Default=false, Callback=function(v) St.bfEnabled = v if v then bfStartAll() else bfStopAll() end end})
-if mobile then
-    Tabs.Characters:AddToggle("TglBFChainBtn", {Title="Show BF Chain UI Button", Default=false, Callback=function(v) St.bfChainBtnEnabled = v end})
-end
-Tabs.Characters:AddToggle("TglTodoBlackFlash", {Title="Auto Todo Black Flash", Default=false, Callback=function(v) St.todoBlackFlashEnabled = v if v then enableTodoBlackFlash() notify("Todo", "Auto Black Flash enabled.", 2) else disconnectTodoBlackFlash() notify("Todo", "Auto Black Flash disabled.", 2) end end})
-Tabs.Characters:AddButton({Title="Instant Blackhole (Yuki)", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/InstantBlackHole.JJS"))() end) end})
-Tabs.Characters:AddToggle("TglNanami", {
-    Title="Auto Nanami Ratio", 
-    Default=false, 
-    Callback=function(v) 
-        if v then startNanami() else stopNanami() end
-    end
-})
-
-Tabs.Characters:AddSection("Auto QTE")
-Tabs.Characters:AddToggle("TglAutoQTE", {
-    Title="Auto QTE (Hiromi & Beam Clash)", 
-    Default=false, 
-    Callback=function(v) 
-        St.autoQteEnabled = v
-        if v then startAutoQTE() else stopAutoQTE() end
-    end
-})
-Tabs.Characters:AddSlider("SldQTESpeed", {
-    Title="QTE Speed (Clicks per sec)", 
-    Min=1, 
-    Max=50, 
-    Default=15, 
-    Rounding=0, 
-    Callback=function(v) St.qteSpeed = v end
-})
-
-Tabs.Characters:AddSection("Yuta Kokusen Automation")
+Tabs.Characters:AddSection("Yuta Kokusen")
 local yutaTargetList = {}
 for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(yutaTargetList, p.Name) end end
 Tabs.Characters:AddDropdown("DpYutaTarget", {Title="Yuta BF Target", Values=#yutaTargetList>0 and yutaTargetList or {"(none)"}, Default=1, Callback=function(v) St.kokusenSelectedTarget = v end})
@@ -4291,9 +5187,25 @@ Tabs.Characters:AddToggle("TglAutoYuta", {Title="Auto Yuta BF (Loop)", Default=f
     end 
 end})
 Tabs.Characters:AddButton({Title="Stop Auto Yuta Loop", Callback=function() stopAutoYuta() if Fluent.Options.TglAutoYuta then Fluent.Options.TglAutoYuta:SetValue(false) end notify("Auto Yuta", "Force Stopped.", 2) end})
-
 Tabs.Characters:AddButton({Title="Yuta BF Oneshot Script", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Lazzexaa/gugugaga/refs/heads/main/yutabf.txt"))() end) end})
-Tabs.Characters:AddButton({Title="Higuruma Vote Viewer", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/HigarumaVoteView.JJS"))() end) end})
+
+Tabs.Characters:AddSection("Black Flash Chain")
+Tabs.Characters:AddParagraph({Title="Auto Black Flash Info", Content="Curved dash-behind + auto Black Flash. Turn it on, then use your BF dash key (PC) or the BF Chain move / button (mobile). Tune the dash geometry and timing below."})
+Tabs.Characters:AddToggle("TglAutoBF", {Title="Auto Black Flash Chain", Default=false, Callback=function(v) St.bfEnabled = v if v then bfStartAll() else bfStopAll() end end})
+Tabs.Characters:AddSlider("BFDetect", {Title="Detect Range", Min=4, Max=20, Default=10, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("DETECT_RANGE", v) end end})
+Tabs.Characters:AddSlider("BFCurve", {Title="Curve Width", Min=0, Max=12, Default=5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CURVE", v) end end})
+Tabs.Characters:AddSlider("BFBackGap", {Title="Back Gap", Min=1, Max=8, Default=4.5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BACKGAP", v) end end})
+Tabs.Characters:AddSlider("BFLead", {Title="Predict Lead", Min=0.1, Max=0.6, Default=0.32, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("PREDICT", v) end end})
+Tabs.Characters:AddSlider("BFCam", {Title="Camera Follow Speed", Min=0.1, Max=1.5, Default=0.6, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_SENS", v) end end})
+Tabs.Characters:AddSlider("BFTiming", {Title="BF Timing", Min=0.15, Max=0.4, Default=0.26, Rounding=3, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BF_TIMING", v) end end})
+Tabs.Characters:AddSlider("BFSpeedCap", {Title="Dash Speed Cap", Min=120, Max=600, Default=320, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("SPEEDCAP", v) end end})
+Tabs.Characters:AddSlider("BFAntiFling", {Title="Anti-Fling Sens", Min=12, Max=60, Default=28, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("ANTIFLING", v) end end})
+Tabs.Characters:AddToggle("TglBFCamFollow", {Title="BF Camera Follow", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_STEER", v) end end})
+Tabs.Characters:AddToggle("TglBFAutoFlash", {Title="Auto Flash on Arrival", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("AUTO_BF", v) end end})
+Tabs.Characters:AddToggle("TglBFChain", {Title="Chain Reposition", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CHAIN", v) end end})
+if mobile then
+    Tabs.Characters:AddToggle("TglBFChainBtn", {Title="Show BF Chain UI Button", Default=false, Callback=function(v) St.bfChainBtnEnabled = v end})
+end
 
 -- [EXTRAS]
 Tabs.Extras:AddButton({Title="Hitbox Extender", Callback=function()
@@ -4311,10 +5223,6 @@ Tabs.Extras:AddButton({Title="Hitbox Extender", Callback=function()
     end) end)
 end})
 
-Tabs.Extras:AddToggle("TglAutoBlock", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v) St.autoBlockEnabled = v if v then notify("Auto Block", "Auto Block + Dash Predict enabled.", 2) else if _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Block", "Disabled.", 2) end end})
-Tabs.Extras:AddToggle("TglAutoProjBlock", {Title="Auto Projectile Block", Default=false, Callback=function(v) St.autoProjBlockEnabled = v if v then notify("Auto Projectile Block", "ON - instantly blocks incoming projectiles within range (ping/fps compensated).", 3) else if not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end notify("Auto Projectile Block", "Disabled.", 2) end end})
-Tabs.Extras:AddToggle("TglAutoPunish", {Title="Auto Punish", Default=false, Callback=function(v) St.autoPunishEnabled = v notify("Auto Punish", v and "Enabled - auto-M1 after a successful block." or "Disabled.", 2) end})
-Tabs.Extras:AddToggle("TglAutoBlockBreak", {Title="Auto Block Break", Default=false, Callback=function(v) St.autoBlockBreakEnabled = v notify("Auto Block Break", v and "Enabled - dash behind blockers when you M1." or "Disabled.", 2) end})
 Tabs.Extras:AddToggle("TglAntiAFK", {Title="Anti-AFK", Default=false, Callback=function(v) St.antiAfkEnabled = v if v then notify("Anti-AFK", "Enabled.", 2) end end})
 Tabs.Extras:AddToggle("TglNoStun", {Title="No Stun", Default=false, Callback=function(v) if v then local s={InSkill=true, NoJump=true, NoSprint=true, Block=true, Stun=true, Knockback=true, Hold=true} St.noStunConn=Workspace:FindFirstChild("Characters").DescendantAdded:Connect(function(d) if s[d.Name] and d.Parent.Parent==LocalPlayer.Character then task.wait() pcall(function() d:Destroy() end) end end) else if St.noStunConn then St.noStunConn:Disconnect() end end end})
 Tabs.Extras:AddToggle("TglNoKnockback", {Title="No Knockback", Default=false, Callback=function(v) getgenv().KnockBackForce = v and 0 or nil end})
@@ -4330,6 +5238,94 @@ Tabs.Extras:AddSlider("SldYonkSpd", {Title="Yonk Speed", Min=0.1, Max=2, Default
 
 -- [ITEMS]
 local mainItemsCache = {}
+-- Item ESP: through-wall highlight + name/distance billboard (green = close, red = far)
+do
+    local esp = {}            -- item -> {hl=Highlight, bb=BillboardGui, lbl=TextLabel}
+    local espLast = 0
+    local NEAR_D, FAR_D = 40, 400
+    local function distColor(d)
+        local t = math.clamp((d - NEAR_D) / (FAR_D - NEAR_D), 0, 1)
+        return Color3.new(t, 1 - t, 0)   -- green up close -> red far away
+    end
+    local function partOf(inst)
+        if inst:IsA("BasePart") then return inst end
+        if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart") end
+        return inst:FindFirstChildWhichIsA("BasePart")
+    end
+    local function destroyEntry(e)
+        pcall(function() if e.hl then e.hl:Destroy() end end)
+        pcall(function() if e.bb then e.bb:Destroy() end end)
+    end
+    _G.NH_clearItemEsp = function()
+        for _, e in pairs(esp) do destroyEntry(e) end
+        esp = {}
+    end
+    local function refreshItemEsp()
+        local folder = Workspace:FindFirstChild("Items")
+        if not folder then return end
+        local ch = LocalPlayer.Character
+        local myHrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        for item, e in pairs(esp) do
+            if not item or item.Parent ~= folder then
+                destroyEntry(e)
+                esp[item] = nil
+            end
+        end
+        for _, child in ipairs(folder:GetChildren()) do
+            local part = partOf(child)
+            if part then
+                local e = esp[child]
+                if not e then
+                    e = {}
+                    pcall(function()
+                        local hl = Instance.new("Highlight")
+                        hl.Name = "NH_ItemESP"
+                        hl.Adornee = child
+                        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        hl.FillTransparency = 0.4
+                        hl.OutlineTransparency = 0
+                        hl.Parent = child
+                        e.hl = hl
+                        local bb = Instance.new("BillboardGui")
+                        bb.Name = "NH_ItemESP"
+                        bb.Adornee = part
+                        bb.Size = UDim2.fromOffset(230, 44)
+                        bb.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+                        bb.AlwaysOnTop = true
+                        bb.MaxDistance = 2000
+                        bb.Parent = part
+                        local lbl = Instance.new("TextLabel")
+                        lbl.BackgroundTransparency = 1
+                        lbl.Size = UDim2.fromScale(1, 1)
+                        lbl.Font = Enum.Font.GothamBold
+                        lbl.TextSize = 18
+                        lbl.TextStrokeTransparency = 0.3
+                        lbl.TextStrokeColor3 = Color3.new(0, 0, 0)
+                        lbl.Text = child.Name
+                        lbl.Parent = bb
+                        e.bb = bb
+                        e.lbl = lbl
+                    end)
+                    esp[child] = e
+                end
+                if e.lbl and myHrp then
+                    local d = math.floor((part.Position - myHrp.Position).Magnitude + 0.5)
+                    local col = distColor(d)
+                    e.lbl.Text = string.format("%s  [%dm]", child.Name, d)
+                    e.lbl.TextColor3 = col
+                    if e.hl then e.hl.FillColor = col e.hl.OutlineColor = col end
+                end
+            end
+        end
+    end
+    RunService.Heartbeat:Connect(function()
+        if not St.itemEspEnabled then return end
+        if os.clock() - espLast < 0.15 then return end
+        espLast = os.clock()
+        refreshItemEsp()
+    end)
+end
+Tabs.Items:AddToggle("TglItemESP", {Title="Item ESP", Default=false, Callback=function(v) St.itemEspEnabled = v if not v then _G.NH_clearItemEsp() end notify("Item ESP", v and "Enabled - items highlighted through walls." or "Disabled.", 2) end})
 local DpItems = Tabs.Items:AddDropdown("DpMainItems", {Title="Select Item", Values={"(press Refresh)"}, Default=1, Callback=function(v) end})
 Tabs.Items:AddButton({
     Title = "Refresh Items",
@@ -4805,10 +5801,33 @@ if mobile then
         if Fluent.Options.TglSweep then Fluent.Options.TglSweep:SetValue(not Fluent.Options.TglSweep.Value); return Fluent.Options.TglSweep.Value end return false
     end, false)
 
-    local huntGui = createFloatButton("HuntBtn", "HUNT", vp.X-160, vp.Y-320, Color3.fromRGB(200,140,30), Color3.fromRGB(255,200,80), function()
-        if St.huntRunning then St.huntRunning = false; return false end
-        task.spawn(runHunt); return true
+    local huntGui = createFloatButton("HuntBtn", "HUNT", vp.X-160, vp.Y-320, Color3.fromRGB(200,40,40), Color3.fromRGB(40,200,40), function()
+        if St.huntRunning then
+            St.huntRunning = false
+            St.acBypassHunting = false
+            notify("Hunt", "Stopped.", 3)
+            return false
+        end
+        task.spawn(runHunt)
+        return true
     end, false)
+    task.spawn(function()
+        while true do
+            task.wait(0.1)
+            pcall(function()
+                local frame = huntGui:FindFirstChild("NHBtn") or huntGui:FindFirstChildWhichIsA("Frame") or huntGui:FindFirstChildWhichIsA("ImageButton") or huntGui:FindFirstChildWhichIsA("TextButton")
+                if frame then
+                    if St.huntRunning then
+                        frame.BackgroundColor3 = Color3.fromRGB(40, 180, 40)
+                        frame.BackgroundTransparency = 0.25
+                    else
+                        frame.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+                        frame.BackgroundTransparency = 0.25
+                    end
+                end
+            end)
+        end
+    end)
 
     local yonkGui = createFloatButton("YonkBtn", "YONK", vp.X-240, vp.Y-320, Color3.fromRGB(200,80,200), Color3.fromRGB(255,150,255), function()
         yonkToggle(); return St.yonkEnabled
