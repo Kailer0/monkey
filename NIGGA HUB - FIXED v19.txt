@@ -131,10 +131,12 @@ local St = {
     dashMultiplierEnabled = false, dashMultiplierValue = 1, yonkEnabled = false, yonkSpeed = 1, yonkAnimTrack = nil, yonkAnim = nil,
     autoQteEnabled = false, qteSpeed = 15, autoDownslamEnabled = false, downslamMode = "blatant", autoUppercutEnabled = false, lockOnEnabled = false, lockOnOrigAutoRotate = true, lockOnToggleOn = false, lockOnTarget = nil, lockOnArmed = false,
     todoEnabled = false, todoBlackFlashEnabled = false, autoBlockEnabled = false, autoPunishEnabled = false, autoBlockBreakEnabled = false, antiAfkEnabled = false, autoProjBlockEnabled = false, autoHarutaDodgeEnabled = false,
+    todoSwapEnabled = false, todoSwapAcBypassed = false, todoSwapReturn = false, todoSwapSelected = "",
+    todoSwapHunting = false, todoSwapAreaEnabled = false, todoSwapArea = "Restaurant",
     harutaBackstabEnabled = false,
     bfChainBtnEnabled = false,
     harutaBsBtnEnabled = false,
-    autoWorldSlashEnabled = false, autoFrogVariantEnabled = false, autoEarthquakeEnabled = false, autoShutUpEnabled = false, itemEspEnabled = false,
+    autoWorldSlashEnabled = false, autoFrogVariantEnabled = false, autoEarthquakeEnabled = false, autoShutUpEnabled = false, autoMahoragaThrowEnabled = false, itemEspEnabled = false,
     flashStepM1Enabled = false, flashStepM1Range = 20,
     autoCounterEnabled = false, autoCounterRange = 22, autoCounterBusy = false, autoCounterCooldown = 0,
     bfLastAttackTime = {}, bfTargetLookSmoothed = {}, bfPrevTargetPos = {}, bfPrevTargetTime = {},
@@ -501,15 +503,28 @@ local function forceReset() pcall(function() ReplicatedStorage:WaitForChild("Kni
 local function checkACStatus()
     local myChar = LocalPlayer.Character; local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
     if not myHRP then notify("AC Check","No character.",4); return end
-    local others={}
+    -- Collect candidate HRPs: real players far enough away + any NPC/dummy in workspace
+    local candidateHRPs = {}
     for _, p in ipairs(Players:GetPlayers()) do
-        if p~=LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
-            if (myHRP.Position-p.Character.HumanoidRootPart.Position).Magnitude >= Cfg.MIN_TARGET_DISTANCE then table.insert(others, p) end
+        if p~=LocalPlayer and p.Character then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+            if hrp and (myHRP.Position-hrp.Position).Magnitude >= Cfg.MIN_TARGET_DISTANCE then
+                table.insert(candidateHRPs, hrp)
+            end
         end
     end
-    if #others==0 then notify("AC Check","No far players found to test on.",4); return end
-    local target = others[math.random(1,#others)]; local targetHRP = target.Character:FindFirstChild("HumanoidRootPart")
-    if not targetHRP then return end
+    -- Also include dummies / NPC models that have a HumanoidRootPart
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("Humanoid") and obj.Health > 0 then
+            local model = obj.Parent
+            if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
+                local hrp = model:FindFirstChild("HumanoidRootPart")
+                if hrp then table.insert(candidateHRPs, hrp) end
+            end
+        end
+    end
+    if #candidateHRPs==0 then notify("AC Check","No targets found nearby (players or dummies).",4); return end
+    local targetHRP = candidateHRPs[math.random(1,#candidateHRPs)]
     local savedCF = myHRP.CFrame; local tpPos = targetHRP.CFrame * CFrame.new(0,0,Cfg.offsetZ+1)
     pcall(function() myChar:PivotTo(tpPos) end)
     myHRP.AssemblyLinearVelocity=Vector3.zero; RunService.Heartbeat:Wait(); RunService.Heartbeat:Wait()
@@ -4126,7 +4141,7 @@ local Tabs = {
 -- ============================================================
 -- Flash Step M1s (PreAwk Mahito M1 Pull) — on M1, if a valid target is within range, do a smooth
 -- cubic ease-out pull to them with the Mahito Chase VFX. Toggle: St.flashStepM1Enabled.
--- Range is read live from St.flashStepM1Range (20-50 studs). All VFX/asset access is pcall-guarded
+-- Range is read live from St.flashStepM1Range (20-200 studs). All VFX/asset access is pcall-guarded
 -- so a missing effect can never break the pull or the hub.
 -- ============================================================
 do
@@ -4275,23 +4290,21 @@ Tabs.Combat:AddToggle("TglAutoDownslam", {Title="Auto Downslam", Default=false, 
 Tabs.Combat:AddDropdown("DpDownslamMode", {Title="Auto Downslam Method", Values={"Blatant", "Legit"}, Default="Blatant", Callback=function(v) St.downslamMode = string.lower(v) end})
 Tabs.Combat:AddToggle("TglAutoUppercut", {Title="Auto Uppercut", Default=false, Callback=function(v) St.autoUppercutEnabled = v; if v then St.autoDownslamEnabled = false; pcall(function() Fluent.Options.TglAutoDownslam:SetValue(false) end) end end})
 Tabs.Combat:AddToggle("TglFlashStepM1", {Title="Flash Step M1s", Default=false, Callback=function(v) St.flashStepM1Enabled = v end})
-Tabs.Combat:AddSlider("SldFlashStepM1Range", {Title="Flash Step Range", Min=20, Max=50, Default=20, Rounding=0, Callback=function(v) St.flashStepM1Range = v end})
+Tabs.Combat:AddSlider("SldFlashStepM1Range", {Title="Flash Step Range", Min=20, Max=200, Default=20, Rounding=0, Callback=function(v) St.flashStepM1Range = v end})
 
 Tabs.Combat:AddSection("Auto Blocking")
-Tabs.Combat:AddToggle("TglAutoBlockC", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v) St.autoBlockEnabled = v if not v and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end end})
-Tabs.Combat:AddToggle("TglAutoProjBlockC", {Title="Auto Projectile Block", Default=false, Callback=function(v) St.autoProjBlockEnabled = v if not v and not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end end})
+Tabs.Combat:AddToggle("TglAutoBlockC", {Title="Auto Block + Dash Predict", Default=false, Callback=function(v)
+    St.autoBlockEnabled = v
+    if not v and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end
+end})
+Tabs.Combat:AddToggle("TglAutoProjBlockC", {Title="Auto Projectile Block", Default=false, Callback=function(v)
+    St.autoProjBlockEnabled = v
+    if not v and not St.autoBlockEnabled and not St.autoPunishEnabled and _G.NH_forceStopBlock then _G.NH_forceStopBlock() end
+end})
 Tabs.Combat:AddToggle("TglAutoPunishC", {Title="Auto Punish", Default=false, Callback=function(v) St.autoPunishEnabled = v end})
 Tabs.Combat:AddToggle("TglAutoBlockBreakC", {Title="Auto Block Break", Default=false, Callback=function(v) St.autoBlockBreakEnabled = v end})
 
--- 0.2 Kill All: sweep / cycle-hunt / reset / AC tools all live together here.
-Tabs.Combat:AddSection("0.2 Kill All")
-Tabs.Combat:AddToggle("TglSweep", {Title="Sweep All", Default=false, Callback=function(v) St.sweepActive = v; if v then Workspace.FallenPartsDestroyHeight = Cfg.fallenHeight runSweep() else Workspace.FallenPartsDestroyHeight = St.originalFallenHeight end end})
-Tabs.Combat:AddToggle("TglSweepOverlay", {Title="Show Sweep Target Overlay", Default=false, Callback=function(v) St.overlayEnabled = v if v then buildOverlay() else destroyOverlay() end end})
-Tabs.Combat:AddButton({Title="Start Hunt", Callback=runHunt})
-Tabs.Combat:AddButton({Title="Stop Hunt", Callback=stopHunt})
-Tabs.Combat:AddToggle("TglDomainTP", {Title="No Domain TP", Default=false, Callback=function(v) St.noDomainTP = v end})
-Tabs.Combat:AddButton({Title="Force Reset", Callback=forceReset})
-Tabs.Combat:AddButton({Title="Check AC Status", Callback=checkACStatus})
+
 
 local LockOnSection = Tabs.Combat:AddSection("Lock-On System")
 Tabs.Combat:AddParagraph({Title="Lock-On Info", Content="PC: hover an enemy and press the Lock-On key to lock. Press it on them again to unlock, or on another enemy to switch.\nMobile: enable this, aim your camera so the enemy is near the middle of your screen, then press the LOCK ON button to lock onto them. Aim at someone else and press again to switch, or press while aiming at your current target (or at empty space) to unlock."})
@@ -4303,10 +4316,8 @@ Tabs.Combat:AddToggle("TglLockOn", {
         St.lockOnEnabled = v 
         if v then 
             enableLockOn() 
-            notify("Lock-On", "Lock-On mode active (Standby).", 4)
         else 
             disableLockOn()
-            notify("Lock-On", "Lock-On mode deactivated.", 2)
         end 
     end
 })
@@ -4476,6 +4487,214 @@ local function enableTodoBlackFlash()
 end
 
 -- ============================================================
+-- TODO SWAP SYSTEM (infinite-range Boogie Woogie position swap)
+-- The swap remote is server-validated by range, so we momentarily TP onto the
+-- chosen target to satisfy that range check, fire the REAL Todo R-special swap
+-- remote (server-sided, NOT a client teleport), then optionally TP back to our
+-- original position. Requires AC bypass first (same idea as the 0.2 Kill All).
+-- ============================================================
+do
+    local TS_SETTLE       = 0.05   -- seconds to let the server register our TP before firing (lower = faster; too low = swap wont land)
+    local TS_DEFAULT_HOLD = 0.30   -- default: hold at our spot (A) just long enough for the swap to READ it, then it relocates us -> clean SWITCH PLACES
+    local TS_FOLLOW_HOLD  = 1.50   -- Follow toggle: hold at A long enough to OUTLAST the swaps ~1s delayed relocation, so we STAY at our old spot
+    -- Named teleport destinations for "Swap To Area": the swap sends the target to one of these.
+    local TODO_SWAP_AREAS = {
+        { name = "Restaurant",  pos = Vector3.new(-57.39, 24.15, -101.54) },
+        { name = "Sewers",      pos = Vector3.new(-113.30, -40.85, -169.86) },
+        { name = "Twin Towers", pos = Vector3.new(45.39, 183.53, 136.13) },
+    }
+    local function todoSwapAreaCF(name)
+        for _, a in ipairs(TODO_SWAP_AREAS) do if a.name == name then return CFrame.new(a.pos) end end
+        return nil
+    end
+
+    -- Build the target list the SAME way the AC check does: every real player
+    -- (except us) PLUS every NPC / dummy humanoid in the workspace. Does not rely
+    -- on Cfg.INCLUDE_NPCS, so dummies always show up in the dropdown.
+    local function todoSwapCollectTargets()
+        local list = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                local core = p.Character:FindFirstChild("HumanoidRootPart") or p.Character:FindFirstChild("Torso")
+                if hum and core and hum.Health > 0 then
+                    table.insert(list, { name = p.Name, core = core, char = p.Character })
+                end
+            end
+        end
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Humanoid") and obj.Health > 0 then
+                local model = obj.Parent
+                if model and model:IsA("Model") and model ~= LocalPlayer.Character and not Players:GetPlayerFromCharacter(model) then
+                    local core = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+                    if core then
+                        -- de-dupe identical dummy names so every dropdown entry stays uniquely selectable
+                        local base, final, n = model.Name, model.Name, 1
+                        local clash = true
+                        while clash do
+                            clash = false
+                            for _, e in ipairs(list) do if e.name == final then clash = true break end end
+                            if clash then n = n + 1; final = base .. " (" .. n .. ")" end
+                        end
+                        table.insert(list, { name = final, core = core, char = model })
+                    end
+                end
+            end
+        end
+        return list
+    end
+    _G.NH_todoSwapTargets = todoSwapCollectTargets
+
+    -- AC verify: the same teleport-and-check-for-snapback test the "Check AC Status"
+    -- button uses. If we are NOT snapped back, AC is bypassed -> arm the system.
+    -- Core AC snap test (NO notifications): briefly TP onto a random target and see if the
+    -- anti-cheat snaps us back. Sets St.todoSwapAcBypassed. Returns true if SNAPPED (AC active).
+    local function todoSwapSnapTest()
+        local myChar = LocalPlayer.Character
+        local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        if not myHRP then return true end
+        local cands = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp and (myHRP.Position - hrp.Position).Magnitude >= Cfg.MIN_TARGET_DISTANCE then table.insert(cands, hrp) end
+            end
+        end
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Humanoid") and obj.Health > 0 then
+                local model = obj.Parent
+                if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
+                    local hrp = model:FindFirstChild("HumanoidRootPart")
+                    if hrp then table.insert(cands, hrp) end
+                end
+            end
+        end
+        if #cands == 0 then return true end
+        local targetHRP = cands[math.random(1, #cands)]
+        local savedCF = myHRP.CFrame
+        local tpPos = targetHRP.CFrame * CFrame.new(0, 0, Cfg.offsetZ + 1)
+        pcall(function() myChar:PivotTo(tpPos) end)
+        myHRP.AssemblyLinearVelocity = Vector3.zero
+        RunService.Heartbeat:Wait(); RunService.Heartbeat:Wait()
+        local snapped, t0 = false, tick()
+        while tick() - t0 < Cfg.STABILITY_DURATION do
+            RunService.Heartbeat:Wait()
+            myChar = LocalPlayer.Character; myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+            if not myChar or not myHRP then snapped = true; break end
+            if (myHRP.Position - tpPos.Position).Magnitude > Cfg.SNAP_THRESHOLD then snapped = true; break end
+        end
+        pcall(function() if myChar then myChar:PivotTo(savedCF) end end)
+        St.todoSwapAcBypassed = not snapped
+        return snapped
+    end
+
+    -- One-shot verify (kept for compatibility / internal use).
+    _G.NH_todoSwapVerifyAC = function()
+        local snapped = todoSwapSnapTest()
+        if snapped then notify("Todo Range Swap", "AC is ACTIVE - keep hunting.", 4)
+        else notify("Todo Range Swap", "AC bypass CONFIRMED - swap armed.", 5) end
+        return not snapped
+    end
+
+    -- Continuous hunt: keep snap-testing until the bypass lands (or Stop Bypass is pressed).
+    _G.NH_todoSwapHuntStart = function()
+        if St.todoSwapHunting then notify("Todo Range Swap", "Already hunting...", 2); return end
+        St.todoSwapHunting = true
+        notify("Todo Range Swap", "Hunting for AC bypass - stay put...", 4)
+        task.spawn(function()
+            local tries = 0
+            while St.todoSwapHunting do
+                tries = tries + 1
+                local snapped = todoSwapSnapTest()
+                if not snapped then
+                    St.todoSwapHunting = false
+                    notify("Todo Range Swap", "AC bypass FOUND in " .. tries .. " tries - swap armed!", 6)
+                    break
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
+    end
+    _G.NH_todoSwapHuntStop = function()
+        if not St.todoSwapHunting then notify("Todo Range Swap", "Not hunting.", 2); return end
+        St.todoSwapHunting = false
+        notify("Todo Range Swap", "Bypass hunt stopped.", 3)
+    end
+
+    -- Fire the REAL Todo Boogie Woogie swap exactly like the working swap button:
+    -- via the Knit CLIENT service signal TodoService.RightActivated:Fire(targetModel),
+    -- passing the actual target character/model object (NOT a RemoteEvent, NOT a name).
+    local TodoSwapKnitService = nil
+    local function getTodoKnitService()
+        if TodoSwapKnitService then return TodoSwapKnitService end
+        pcall(function()
+            local Knit = require(ReplicatedStorage.Knit.Knit)
+            TodoSwapKnitService = Knit.GetService("TodoService")
+        end)
+        return TodoSwapKnitService
+    end
+    local function fireTodoSwap(targetObj)
+        if not targetObj then return false end
+        local svc = getTodoKnitService()
+        if not svc then return false end
+        return pcall(function() svc.RightActivated:Fire(targetObj) end)
+    end
+
+    -- Core: quick TP onto target -> fire swap remote -> optional TP back home.
+    _G.NH_todoSwapExecute = function(targetName)
+        if not St.todoSwapEnabled then notify("Todo Swap", "Enable Todo Swap first.", 3); return end
+        if not St.todoSwapAcBypassed then notify("Todo Swap", "Bypass AC first.", 3); return end
+        local myChar = LocalPlayer.Character
+        local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        if not myHRP then notify("Todo Swap", "No character.", 3); return end
+        if myChar:GetAttribute("Moveset") ~= "Todo" then notify("Todo Swap", "Must have the Todo moveset equipped.", 4); return end
+        if not targetName or targetName == "" or targetName == "(press Refresh)" or targetName == "(none found)" then
+            notify("Todo Swap", "Pick a target first.", 3); return
+        end
+        local target
+        for _, t in ipairs(todoSwapCollectTargets()) do if t.name == targetName then target = t break end end
+        if not target or not target.core or not target.core.Parent then notify("Todo Swap", "Target not found. Refresh.", 3); return end
+
+        -- Swap ORIGIN = where the target ends up. Normally our own position (we switch places).
+        -- With "Swap To Area" on, the origin becomes the chosen AREA, so the target is relocated
+        -- there (we take their old spot; with Follow on we end up in the area too).
+        local origCF = myHRP.CFrame
+        if St.todoSwapAreaEnabled then
+            local areaCF = todoSwapAreaCF(St.todoSwapArea)
+            if areaCF then origCF = areaCF else notify("Todo Range Swap", "Pick an area first.", 3) end
+        end
+        -- 1) TP the whole CHARACTER onto the target (PivotTo = character-based), brief settle so
+        --    the SERVER registers us, then fire the swap. This is a PLAIN swap: we trade places
+        --    (we -> their spot, they -> our spot). Nothing holds or fights the swap.
+        pcall(function() myChar:PivotTo(target.core.CFrame * CFrame.new(0, 0, 3)) end)
+        if myHRP then myHRP.AssemblyLinearVelocity = Vector3.zero end
+        task.wait(TS_SETTLE)
+        -- 2) fire the REAL swap via the Knit client signal, passing the target model
+        local ok = fireTodoSwap(target.char)
+        if not ok then notify("Todo Swap", "Swap signal failed (Knit TodoService not found).", 4) end
+
+        -- 3) Hold our CHARACTER at our saved coords (A) after firing. The swap reads our position
+        --    a moment later and exchanges it with the target, so holding at A is what makes the
+        --    switch land cleanly. HOW LONG we hold decides the outcome:
+        --      * DEFAULT (toggle off): SHORT hold - just long enough for the swap to read A, then
+        --        we let it relocate us -> clean SWITCH PLACES (we end at their spot, they at ours).
+        --      * FOLLOW toggle (on): LONG hold that OUTLASTS the swaps ~1s delayed relocation, so
+        --        we stay put and end at OUR old spot (A) - where the target just landed.
+        local holdDur = St.todoSwapReturn and TS_FOLLOW_HOLD or TS_DEFAULT_HOLD
+        local holdUntil = tick() + holdDur
+        while tick() < holdUntil do
+            local c = LocalPlayer.Character
+            if c then
+                pcall(function() c:PivotTo(origCF) end)
+                local h = c:FindFirstChild("HumanoidRootPart")
+                if h then h.AssemblyLinearVelocity = Vector3.zero end
+            end
+            RunService.Heartbeat:Wait()
+        end
+    end
+end
+
+-- ============================================================
 -- AUTO MOVE VARIANTS (World Slash / Frog / Earthquake / Shut Up)
 -- Services verified live via MCP under ReplicatedStorage.Knit.Knit.Services:
 --   RushService / FlameArrowService / ItadoriService / NueService / EarthquakeService.
@@ -4567,6 +4786,89 @@ do
         _G.EARTHQUAKE_CHARCONN = LocalPlayer.CharacterAdded:Connect(eqConnect)
     end
     _G.NH_disableEq = disconnectEq
+
+    -- Auto Mahoraga Throw (aim where you look): while the Mahoraga throw animation plays,
+    -- keep turning your HumanoidRootPart to face the camera's aim direction so the thrown
+    -- object flies exactly where you're looking. Works on PC and mobile (aim = camera, so
+    -- there is no keyboard/mouse dependency; on mobile you aim by dragging the camera).
+    local mtThrowAnim = "rbxassetid://138852224035589"
+    local mtActiveTrack = nil
+    local mtAimConn = nil
+    local mtAnimConns = {}
+    local mtCharConn = nil
+    local mtGui = nil
+    local mtLabel = nil
+    local function mtEnsureGui()
+        if mtGui and mtGui.Parent then return end
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+        mtGui = Instance.new("ScreenGui")
+        mtGui.Name = "NH_MahoragaThrowGui"
+        mtGui.ResetOnSpawn = false
+        mtGui.IgnoreGuiInset = true
+        mtGui.DisplayOrder = 999
+        mtGui.Parent = pg
+        mtLabel = Instance.new("TextLabel")
+        mtLabel.Name = "StatusLabel"
+        mtLabel.Size = UDim2.new(0, 150, 0, 40)
+        mtLabel.Position = UDim2.new(1, -160, 1, -50)
+        mtLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        mtLabel.BackgroundTransparency = 0.5
+        mtLabel.TextColor3 = Color3.fromRGB(255, 255, 0) -- yellow
+        mtLabel.Font = Enum.Font.GothamBold
+        mtLabel.TextSize = 16
+        mtLabel.Text = "Aiming"
+        mtLabel.BorderSizePixel = 0
+        mtLabel.Visible = false
+        mtLabel.Parent = mtGui
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 8)
+        c.Parent = mtLabel
+    end
+    local function mtHookChar(character)
+        local humanoid = character:WaitForChild("Humanoid", 5)
+        if not humanoid then return end
+        table.insert(mtAnimConns, humanoid.AnimationPlayed:Connect(function(track)
+            if not St.autoMahoragaThrowEnabled then return end
+            if track.Animation and track.Animation.AnimationId == mtThrowAnim then
+                mtActiveTrack = track
+                mtEnsureGui()
+                if mtLabel then mtLabel.Visible = true end
+            end
+        end))
+    end
+    local function mtDisconnect()
+        for _, c in ipairs(mtAnimConns) do pcall(function() c:Disconnect() end) end
+        mtAnimConns = {}
+        if mtCharConn then pcall(function() mtCharConn:Disconnect() end) mtCharConn = nil end
+        if mtAimConn then pcall(function() mtAimConn:Disconnect() end) mtAimConn = nil end
+        mtActiveTrack = nil
+        if mtLabel then mtLabel.Visible = false end
+    end
+    _G.NH_enableMahoragaThrow = function()
+        mtDisconnect()
+        mtEnsureGui()
+        if LocalPlayer.Character then mtHookChar(LocalPlayer.Character) end
+        mtCharConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
+            mtActiveTrack = nil
+            if mtLabel then mtLabel.Visible = false end
+            mtHookChar(newChar)
+        end)
+        mtAimConn = RunService.Heartbeat:Connect(function()
+            if not St.autoMahoragaThrowEnabled then return end
+            if mtActiveTrack and (not mtActiveTrack.IsPlaying or mtActiveTrack.TimePosition >= mtActiveTrack.Length) then
+                mtActiveTrack = nil
+                if mtLabel then mtLabel.Visible = false end
+                return
+            end
+            if not mtActiveTrack then return end
+            local char = LocalPlayer.Character
+            local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+            local cam = workspace.CurrentCamera
+            if not myHRP or not cam then return end
+            myHRP.CFrame = CFrame.new(myHRP.Position, myHRP.Position + cam.CFrame.LookVector)
+        end)
+    end
+    _G.NH_disableMahoragaThrow = mtDisconnect
 
     -- Auto Shut Up (Charles / Mangaka): when you use the Shut Up move, instantly turn your BACK
     -- toward the nearest enemy within range (Shut Up only lands when the target is behind you).
@@ -5126,7 +5428,6 @@ do
             task.wait(0.4)
             if St.autoCounterEnabled then armHitRetry() end
         end)
-        notify("Auto Counter", "Enabled. Fires counter on any incoming threat.", 3)
     end
 
     local function disableAutoCounter()
@@ -5140,7 +5441,6 @@ do
         if Cn.autoCounterHitConn then Cn.autoCounterHitConn:Disconnect(); Cn.autoCounterHitConn = nil end
         if Cn.autoCounterCharConn then Cn.autoCounterCharConn:Disconnect(); Cn.autoCounterCharConn = nil end
         acEnemyData = {}
-        notify("Auto Counter", "Disabled.", 2)
     end
 
     -- Expose for UI toggle and potential reuse
@@ -5148,15 +5448,18 @@ do
     _G.NH_disableAutoCounter = disableAutoCounter
 end
 
+-- ── SECTION 1: Auto Character Moves ─────────────────────────
 Tabs.Characters:AddSection("Auto Character Moves")
 Tabs.Characters:AddToggle("TglTodoPerfectSwap", {Title="Auto Todo Perfect Swap", Default=false, Callback=function(v) St.todoEnabled = v end})
 Tabs.Characters:AddToggle("TglTodoBlackFlash", {Title="Auto Todo Black Flash", Default=false, Callback=function(v) St.todoBlackFlashEnabled = v if v then enableTodoBlackFlash() else disconnectTodoBlackFlash() end end})
 Tabs.Characters:AddToggle("TglNanami", {Title="Auto Nanami Ratio", Default=false, Callback=function(v) if v then startNanami() else stopNanami() end end})
 Tabs.Characters:AddButton({Title="Instant Blackhole (Yuki)", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/InstantBlackHole.JJS"))() end) end})
-Tabs.Characters:AddToggle("TglAutoWorldSlash", {Title="Auto World Cutting Slash", Default=false, Callback=function(v) St.autoWorldSlashEnabled = v if v then _G.NH_enableWorldSlash() else _G.NH_disableWorldSlash() end notify("Auto World Slash", v and "Enabled - use the move with a full ult bar." or "Disabled.", 2) end})
-Tabs.Characters:AddToggle("TglAutoFrogVariant", {Title="Auto Frog Variant (Megumi)", Default=false, Callback=function(v) St.autoFrogVariantEnabled = v if v then _G.NH_enableFrog() else _G.NH_disableFrog() end notify("Auto Frog Variant", v and "Enabled." or "Disabled.", 2) end})
-Tabs.Characters:AddToggle("TglAutoEarthquake", {Title="Auto Earthquake (Mahoraga)", Default=false, Callback=function(v) St.autoEarthquakeEnabled = v if v then _G.NH_enableEq() else _G.NH_disableEq() end notify("Auto Earthquake", v and "Enabled." or "Disabled.", 2) end})
-Tabs.Characters:AddToggle("TglAutoShutUp", {Title="Auto Shut Up (Mangaka)", Default=false, Callback=function(v) St.autoShutUpEnabled = v if v then _G.NH_enableShutUp() else _G.NH_disableShutUp() end notify("Auto Shut Up", v and "Enabled - snaps your back to the nearest enemy on the move." or "Disabled.", 2) end})
+Tabs.Characters:AddToggle("TglAutoWorldSlash", {Title="Auto World Cutting Slash", Default=false, Callback=function(v) St.autoWorldSlashEnabled = v if v then _G.NH_enableWorldSlash() else _G.NH_disableWorldSlash() end end})
+Tabs.Characters:AddToggle("TglAutoFrogVariant", {Title="Auto Frog Variant (Megumi)", Default=false, Callback=function(v) St.autoFrogVariantEnabled = v if v then _G.NH_enableFrog() else _G.NH_disableFrog() end end})
+Tabs.Characters:AddToggle("TglAutoEarthquake", {Title="Auto Earthquake (Mahoraga)", Default=false, Callback=function(v) St.autoEarthquakeEnabled = v if v then _G.NH_enableEq() else _G.NH_disableEq() end end})
+Tabs.Characters:AddParagraph({Title="Auto Mahoraga Throw Info", Content="Aim your camera where you want to throw."})
+Tabs.Characters:AddToggle("TglAutoMahoragaThrow", {Title="Auto Mahoraga Throw", Default=false, Callback=function(v) St.autoMahoragaThrowEnabled = v if v then _G.NH_enableMahoragaThrow() else _G.NH_disableMahoragaThrow() end end})
+Tabs.Characters:AddToggle("TglAutoShutUp", {Title="Auto Shut Up (Mangaka)", Default=false, Callback=function(v) St.autoShutUpEnabled = v if v then _G.NH_enableShutUp() else _G.NH_disableShutUp() end end})
 Tabs.Characters:AddToggle("TglAutoCounter", {Title="Auto Counter", Default=false, Callback=function(v) if v then _G.NH_enableAutoCounter() else _G.NH_disableAutoCounter() end end})
 
 Tabs.Characters:AddParagraph({Title="Haruta Backstab Info", Content="Equip Haruta with sword. Press 2 (PC) or tap your 2nd move (mobile) to dash behind your target and backstab. Want a separate mobile button too? Turn on 'Show Backstab UI Button'. You can enable this UI button in the Settings tab."})
@@ -5168,6 +5471,66 @@ Tabs.Characters:AddToggle("TglAutoQTE", {Title="Auto QTE (Hiromi & Beam Clash)",
 Tabs.Characters:AddSlider("SldQTESpeed", {Title="QTE Speed (Clicks per sec)", Min=1, Max=50, Default=15, Rounding=0, Callback=function(v) St.qteSpeed = v end})
 Tabs.Characters:AddButton({Title="Higuruma Vote Viewer", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Dragonfly5101/Minosr/refs/heads/main/HigarumaVoteView.JJS"))() end) end})
 
+-- ── SECTION 2: Black Flash Chain ─────────────────────────────
+Tabs.Characters:AddSection("Black Flash Chain")
+Tabs.Characters:AddParagraph({Title="Auto Black Flash Info", Content="Curved dash-behind + auto Black Flash. Turn it on, then use your BF dash key (PC) or the BF Chain move / button (mobile). Tune the dash geometry and timing below."})
+Tabs.Characters:AddToggle("TglAutoBF", {Title="Auto Black Flash Chain", Default=false, Callback=function(v) St.bfEnabled = v if v then bfStartAll() else bfStopAll() end end})
+Tabs.Characters:AddSlider("BFDetect", {Title="Detect Range", Min=4, Max=20, Default=10, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("DETECT_RANGE", v) end end})
+Tabs.Characters:AddSlider("BFCurve", {Title="Curve Width", Min=0, Max=12, Default=5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CURVE", v) end end})
+Tabs.Characters:AddSlider("BFBackGap", {Title="Back Gap", Min=1, Max=8, Default=4.5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BACKGAP", v) end end})
+Tabs.Characters:AddSlider("BFLead", {Title="Predict Lead", Min=0.1, Max=0.6, Default=0.32, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("PREDICT", v) end end})
+Tabs.Characters:AddSlider("BFCam", {Title="Camera Follow Speed", Min=0.1, Max=1.5, Default=0.6, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_SENS", v) end end})
+Tabs.Characters:AddSlider("BFTiming", {Title="BF Timing", Min=0.15, Max=0.4, Default=0.26, Rounding=3, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BF_TIMING", v) end end})
+Tabs.Characters:AddSlider("BFSpeedCap", {Title="Dash Speed Cap", Min=120, Max=600, Default=320, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("SPEEDCAP", v) end end})
+Tabs.Characters:AddSlider("BFAntiFling", {Title="Anti-Fling Sens", Min=12, Max=60, Default=28, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("ANTIFLING", v) end end})
+Tabs.Characters:AddToggle("TglBFCamFollow", {Title="BF Camera Follow", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_STEER", v) end end})
+Tabs.Characters:AddToggle("TglBFAutoFlash", {Title="Auto Flash on Arrival", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("AUTO_BF", v) end end})
+Tabs.Characters:AddToggle("TglBFChain", {Title="Chain Reposition", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CHAIN", v) end end})
+if mobile then
+    Tabs.Characters:AddToggle("TglBFChainBtn", {Title="Show BF Chain UI Button", Default=false, Callback=function(v) St.bfChainBtnEnabled = v end})
+end
+
+-- ── SECTION 3: 0.2 Kill All (Gojo) ──────────────────────────
+Tabs.Characters:AddSection("0.2 Kill All (Gojo)")
+Tabs.Characters:AddToggle("TglSweep", {Title="Sweep All", Default=false, Callback=function(v) St.sweepActive = v; if v then Workspace.FallenPartsDestroyHeight = Cfg.fallenHeight runSweep() else Workspace.FallenPartsDestroyHeight = St.originalFallenHeight end end})
+Tabs.Characters:AddToggle("TglSweepOverlay", {Title="Show Sweep Target Overlay", Default=false, Callback=function(v) St.overlayEnabled = v if v then buildOverlay() else destroyOverlay() end end})
+Tabs.Characters:AddButton({Title="Start Hunt", Callback=runHunt})
+Tabs.Characters:AddButton({Title="Stop Hunt", Callback=stopHunt})
+Tabs.Characters:AddToggle("TglDomainTP", {Title="No Domain TP", Default=false, Callback=function(v) St.noDomainTP = v end})
+Tabs.Characters:AddButton({Title="Force Reset", Callback=forceReset})
+Tabs.Characters:AddButton({Title="Check AC Status", Callback=checkACStatus})
+
+-- ── Todo Range Swap (infinite range) ────────────────
+Tabs.Characters:AddSection("Todo Range Swap")
+Tabs.Characters:AddParagraph({Title="Todo Range Swap Info", Content="Infinite-range Boogie Woogie swap. 1) Enable Todo Range Swap. 2) If it says bypass AC first, press 'Bypass Ac' - it keeps hunting until the bypass lands (press 'Stop Bypass' to cancel). 3) Refresh + pick a player/dummy. 4) Press 'Swap With Selected'. By default you SWITCH PLACES (you end at their spot, they at yours); turn on 'Swap bring to me' to stay put. Turn on 'Swap To Area' to instead send the target to the area picked in the dropdown."})
+Tabs.Characters:AddToggle("TglTodoSwapEnable", {Title="Enable Todo Swap", Default=false, Callback=function(v)
+    if v and not St.todoSwapAcBypassed then
+        notify("Todo Range Swap", "Bypass AC first (press Bypass Ac).", 3)
+        St.todoSwapEnabled = false
+        pcall(function() Fluent.Options.TglTodoSwapEnable:SetValue(false) end)
+        return
+    end
+    St.todoSwapEnabled = v
+end})
+Tabs.Characters:AddButton({Title="Bypass Ac", Callback=function() if _G.NH_todoSwapHuntStart then _G.NH_todoSwapHuntStart() end end})
+Tabs.Characters:AddButton({Title="Stop Bypass", Callback=function() if _G.NH_todoSwapHuntStop then _G.NH_todoSwapHuntStop() end end})
+local DpTodoSwap = Tabs.Characters:AddDropdown("DpTodoSwapTarget", {Title="Swap Target (players + dummies)", Values={"(press Refresh)"}, Default=1, Callback=function(v) St.todoSwapSelected = v end})
+Tabs.Characters:AddButton({Title="Refresh Swap Targets", Callback=function()
+    local names = {}
+    if _G.NH_todoSwapTargets then for _, t in ipairs(_G.NH_todoSwapTargets()) do table.insert(names, t.name) end end
+    if #names == 0 then names = {"(none found)"} end
+    DpTodoSwap:SetValues(names)
+    notify("Todo Range Swap", "Found " .. #names .. " targets.", 2)
+end})
+Tabs.Characters:AddToggle("TglTodoSwapReturn", {Title="Swap bring to me", Default=false, Callback=function(v) St.todoSwapReturn = v end})
+Tabs.Characters:AddButton({Title="Swap With Selected", Callback=function()
+    local sel = (Fluent.Options.DpTodoSwapTarget and Fluent.Options.DpTodoSwapTarget.Value) or St.todoSwapSelected
+    if _G.NH_todoSwapExecute then _G.NH_todoSwapExecute(sel) end
+end})
+Tabs.Characters:AddDropdown("DpTodoSwapArea", {Title="Swap Area (for Swap To Area)", Values={"Restaurant", "Sewers", "Twin Towers"}, Default=1, Callback=function(v) St.todoSwapArea = v end})
+Tabs.Characters:AddToggle("TglTodoSwapArea", {Title="Swap To Area (send target to spot above)", Default=false, Callback=function(v) St.todoSwapAreaEnabled = v end})
+
+-- ── SECTION 4: Yuta Kokusen ──────────────────────────────────
 Tabs.Characters:AddSection("Yuta Kokusen")
 local yutaTargetList = {}
 for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(yutaTargetList, p.Name) end end
@@ -5189,24 +5552,6 @@ end})
 Tabs.Characters:AddButton({Title="Stop Auto Yuta Loop", Callback=function() stopAutoYuta() if Fluent.Options.TglAutoYuta then Fluent.Options.TglAutoYuta:SetValue(false) end notify("Auto Yuta", "Force Stopped.", 2) end})
 Tabs.Characters:AddButton({Title="Yuta BF Oneshot Script", Callback=function() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/Lazzexaa/gugugaga/refs/heads/main/yutabf.txt"))() end) end})
 
-Tabs.Characters:AddSection("Black Flash Chain")
-Tabs.Characters:AddParagraph({Title="Auto Black Flash Info", Content="Curved dash-behind + auto Black Flash. Turn it on, then use your BF dash key (PC) or the BF Chain move / button (mobile). Tune the dash geometry and timing below."})
-Tabs.Characters:AddToggle("TglAutoBF", {Title="Auto Black Flash Chain", Default=false, Callback=function(v) St.bfEnabled = v if v then bfStartAll() else bfStopAll() end end})
-Tabs.Characters:AddSlider("BFDetect", {Title="Detect Range", Min=4, Max=20, Default=10, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("DETECT_RANGE", v) end end})
-Tabs.Characters:AddSlider("BFCurve", {Title="Curve Width", Min=0, Max=12, Default=5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CURVE", v) end end})
-Tabs.Characters:AddSlider("BFBackGap", {Title="Back Gap", Min=1, Max=8, Default=4.5, Rounding=1, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BACKGAP", v) end end})
-Tabs.Characters:AddSlider("BFLead", {Title="Predict Lead", Min=0.1, Max=0.6, Default=0.32, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("PREDICT", v) end end})
-Tabs.Characters:AddSlider("BFCam", {Title="Camera Follow Speed", Min=0.1, Max=1.5, Default=0.6, Rounding=2, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_SENS", v) end end})
-Tabs.Characters:AddSlider("BFTiming", {Title="BF Timing", Min=0.15, Max=0.4, Default=0.26, Rounding=3, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("BF_TIMING", v) end end})
-Tabs.Characters:AddSlider("BFSpeedCap", {Title="Dash Speed Cap", Min=120, Max=600, Default=320, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("SPEEDCAP", v) end end})
-Tabs.Characters:AddSlider("BFAntiFling", {Title="Anti-Fling Sens", Min=12, Max=60, Default=28, Rounding=0, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("ANTIFLING", v) end end})
-Tabs.Characters:AddToggle("TglBFCamFollow", {Title="BF Camera Follow", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CAM_STEER", v) end end})
-Tabs.Characters:AddToggle("TglBFAutoFlash", {Title="Auto Flash on Arrival", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("AUTO_BF", v) end end})
-Tabs.Characters:AddToggle("TglBFChain", {Title="Chain Reposition", Default=true, Callback=function(v) if _G.NH_bfSet then _G.NH_bfSet("CHAIN", v) end end})
-if mobile then
-    Tabs.Characters:AddToggle("TglBFChainBtn", {Title="Show BF Chain UI Button", Default=false, Callback=function(v) St.bfChainBtnEnabled = v end})
-end
-
 -- [EXTRAS]
 Tabs.Extras:AddButton({Title="Hitbox Extender", Callback=function()
     if St.hitboxLoaded then return end
@@ -5223,7 +5568,7 @@ Tabs.Extras:AddButton({Title="Hitbox Extender", Callback=function()
     end) end)
 end})
 
-Tabs.Extras:AddToggle("TglAntiAFK", {Title="Anti-AFK", Default=false, Callback=function(v) St.antiAfkEnabled = v if v then notify("Anti-AFK", "Enabled.", 2) end end})
+Tabs.Extras:AddToggle("TglAntiAFK", {Title="Anti-AFK", Default=false, Callback=function(v) St.antiAfkEnabled = v end})
 Tabs.Extras:AddToggle("TglNoStun", {Title="No Stun", Default=false, Callback=function(v) if v then local s={InSkill=true, NoJump=true, NoSprint=true, Block=true, Stun=true, Knockback=true, Hold=true} St.noStunConn=Workspace:FindFirstChild("Characters").DescendantAdded:Connect(function(d) if s[d.Name] and d.Parent.Parent==LocalPlayer.Character then task.wait() pcall(function() d:Destroy() end) end end) else if St.noStunConn then St.noStunConn:Disconnect() end end end})
 Tabs.Extras:AddToggle("TglNoKnockback", {Title="No Knockback", Default=false, Callback=function(v) getgenv().KnockBackForce = v and 0 or nil end})
 Tabs.Extras:AddToggle("TglInvisNoclip", {Title="Invisibility", Default=false, Callback=function(v) St.invisActive = v if v then setupInvisForChar(LocalPlayer.Character) startNoclip() else cleanupInvis(LocalPlayer.Character) if Cn.noclipConn then Cn.noclipConn:Disconnect() end end end})
@@ -5325,7 +5670,7 @@ do
         refreshItemEsp()
     end)
 end
-Tabs.Items:AddToggle("TglItemESP", {Title="Item ESP", Default=false, Callback=function(v) St.itemEspEnabled = v if not v then _G.NH_clearItemEsp() end notify("Item ESP", v and "Enabled - items highlighted through walls." or "Disabled.", 2) end})
+Tabs.Items:AddToggle("TglItemESP", {Title="Item ESP", Default=false, Callback=function(v) St.itemEspEnabled = v if not v then _G.NH_clearItemEsp() end end})
 local DpItems = Tabs.Items:AddDropdown("DpMainItems", {Title="Select Item", Values={"(press Refresh)"}, Default=1, Callback=function(v) end})
 Tabs.Items:AddButton({
     Title = "Refresh Items",
